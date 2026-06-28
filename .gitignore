@@ -1,0 +1,17 @@
+# Compiled binary (module name)
+/smarter_resume
+
+# Go build/test artifacts
+*.exe
+*.test
+*.out
+*.prof
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
