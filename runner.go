@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -160,11 +161,12 @@ func sessionIDFromPath(path string) string {
 func runClaude(ctx context.Context, cfg config, args []string, cwd string, runStarted time.Time, preRunFile string, preRunLines int) (int, error) {
 	_ = os.Remove(cfg.WarnFile)
 
-	cmd := exec.CommandContext(ctx, cfg.ClaudeBin, args...)
+	bin, env := resolveLaunch(cfg, args)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Stdin = cfg.Stdin
 	cmd.Stdout = cfg.Stdout
 	cmd.Stderr = cfg.Stderr
-	cmd.Env = cfg.Env
+	cmd.Env = env
 	cmd.Dir = cwd
 
 	if err := cmd.Start(); err != nil {
@@ -208,6 +210,70 @@ func runClaude(ctx context.Context, cfg config, args []string, cwd string, runSt
 	<-signalDone
 
 	return processExitCode(cmd.ProcessState, err), nil
+}
+
+// resolveLaunch decides which binary to exec and with what environment so that
+// cmux's claude hooks fire exactly once and the launch never recurses.
+//
+//   - If cmux already injected its hooks (it launched smarter_resume as its
+//     claude binary, so the hook --settings are already in args), run the real
+//     claude directly and pass those args straight through.
+//   - Otherwise, inside a cmux surface with a shim available (e.g. launched via
+//     a `claude`/`cc` alias), route through cmux's shim so it injects hooks —
+//     pinning CMUX_CUSTOM_CLAUDE_PATH to the real claude so the shim resolves
+//     back to claude instead of recursing into smarter_resume.
+//   - With no cmux shim (or hooks already present), run the real claude.
+func resolveLaunch(cfg config, args []string) (string, []string) {
+	if cfg.CmuxShim == "" || argsHaveCmuxHooks(args) {
+		return cfg.ClaudeBin, cfg.Env
+	}
+	env := setEnvVar(cfg.Env, "CMUX_CUSTOM_CLAUDE_PATH", cfg.ClaudeBin)
+	return cfg.CmuxShim, env
+}
+
+// argsHaveCmuxHooks reports whether args already carry cmux's injected hook
+// configuration, signalling that cmux wrapped this process and we must not wrap
+// it again.
+func argsHaveCmuxHooks(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		var value string
+		switch {
+		case strings.HasPrefix(arg, "--settings="):
+			value = strings.TrimPrefix(arg, "--settings=")
+		case arg == "--settings" && i+1 < len(args):
+			value = args[i+1]
+			i++
+		default:
+			continue
+		}
+		if strings.Contains(value, "CMUX_CLAUDE_HOOK") ||
+			strings.Contains(value, "hooks claude ") ||
+			strings.Contains(value, "hooks feed") {
+			return true
+		}
+	}
+	return false
+}
+
+// setEnvVar returns a copy of env with key set to value, replacing any existing
+// definition.
+func setEnvVar(env []string, key string, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, prefix) {
+			out = append(out, prefix+value)
+			replaced = true
+			continue
+		}
+		out = append(out, kv)
+	}
+	if !replaced {
+		out = append(out, prefix+value)
+	}
+	return out
 }
 
 func shouldForwardInterrupt(process *os.Process) bool {

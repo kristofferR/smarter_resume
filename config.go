@@ -21,6 +21,7 @@ const (
 
 type config struct {
 	ClaudeBin       string
+	CmuxShim        string
 	ProjectsDir     string
 	WarnFile        string
 	DefaultArgs     []string
@@ -49,6 +50,15 @@ func loadConfig() (config, error) {
 		if err != nil {
 			return config{}, err
 		}
+	}
+
+	// When launched inside a cmux terminal surface we route through cmux's own
+	// claude shim so its session/notification hooks fire — but only when cmux
+	// has not already wrapped us (see resolveLaunch). Detecting the shim here
+	// keeps that decision out of the hot path.
+	cmuxShim := ""
+	if os.Getenv("CMUX_SURFACE_ID") != "" {
+		cmuxShim = findCmuxShim(os.Getenv("CMUX_CLAUDE_WRAPPER_SHIM"), os.Getenv("PATH"))
 	}
 
 	bufferSecs, err := intEnv("BUFFER_SECS", defaultBufferSecs)
@@ -81,6 +91,7 @@ func loadConfig() (config, error) {
 
 	return config{
 		ClaudeBin:       claudeBin,
+		CmuxShim:        cmuxShim,
 		ProjectsDir:     projectsDir,
 		WarnFile:        filepath.Join(claudeConfigDir, ".rl_warn"),
 		DefaultArgs:     defaultArgs,
@@ -176,11 +187,56 @@ func findClaudeBin(pathEnv string, self string) (string, error) {
 			if selfInfo != nil && os.SameFile(info, selfInfo) {
 				continue
 			}
+			// Skip cmux's claude shim / bundled wrapper. Resolving it as the
+			// "real" claude makes the shim re-enter this wrapper (cmux is often
+			// configured to launch smarter_resume as its claude binary), which
+			// recurses until cmux's socket check happens to fail — the source of
+			// the multi-second startup hang and piled-up processes.
+			if isCmuxClaudeShim(candidate) {
+				continue
+			}
 			return candidate, nil
 		}
 	}
 
 	return "", errors.New("CLAUDE_BIN is unset and no real claude executable was found in PATH")
+}
+
+// isCmuxClaudeShim reports whether path is one of cmux's claude entry points
+// (the per-surface CLI shim or the bundled app wrapper) rather than a real
+// claude binary. cmux's own wrapper skips these same paths when it resolves the
+// real claude, so we mirror that intent here.
+func isCmuxClaudeShim(path string) bool {
+	slash := filepath.ToSlash(path)
+	return strings.Contains(slash, "/cmux-cli-shims/") ||
+		strings.Contains(slash, "/cmux.app/")
+}
+
+// findCmuxShim locates cmux's claude shim so smarter_resume can route through it
+// for hook injection. It prefers the surface-pinned CMUX_CLAUDE_WRAPPER_SHIM and
+// otherwise scans PATH for a claude under a cmux-cli-shims directory. Returns ""
+// when no usable shim is found.
+func findCmuxShim(pinnedShim string, pathEnv string) string {
+	if pinnedShim != "" {
+		if info, err := os.Stat(pinnedShim); err == nil && !info.IsDir() && isExecutable(info) {
+			return pinnedShim
+		}
+	}
+	for _, dir := range filepath.SplitList(pathEnv) {
+		if dir == "" {
+			dir = "."
+		}
+		if !strings.Contains(filepath.ToSlash(dir), "/cmux-cli-shims") {
+			continue
+		}
+		for _, name := range claudeExecutableNames() {
+			candidate := filepath.Join(dir, name)
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && isExecutable(info) {
+				return candidate
+			}
+		}
+	}
+	return ""
 }
 
 func claudeExecutableNames() []string {

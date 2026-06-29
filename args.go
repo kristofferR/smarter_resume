@@ -14,6 +14,10 @@ const (
 // Resume starts a new Claude process for the same session. Preserve startup
 // context flags, but do not replay positional prompts or one-shot modes such as
 // --print; the resume message below is the only prompt for the resumed turn.
+//
+// --session-id is deliberately absent: resume passes --resume <id>, and Claude
+// rejects --session-id alongside --resume. cmux injects --session-id on the
+// first launch, so it must be dropped (not preserved) when we resume.
 var resumePassthroughFlags = makeResumePassthroughFlags()
 
 func makeResumePassthroughFlags() map[string]flagValueMode {
@@ -53,7 +57,6 @@ func makeResumePassthroughFlags() map[string]flagValueMode {
 		"--permission-mode",
 		"--plugin-dir",
 		"--plugin-url",
-		"--session-id",
 		"--setting-sources",
 		"--settings",
 		"--system-prompt",

@@ -472,7 +472,6 @@ func TestResumeArgsPreserveStartupContextWithoutReplayingPrompt(t *testing.T) {
 	want := []string{
 		"--dangerously-skip-permissions",
 		"--settings", "settings.json",
-		"--session-id=11111111-1111-1111-1111-111111111111",
 		"--model", "sonnet",
 		"--system-prompt-file", "system.md",
 		"--append-system-prompt-file=append.md",
@@ -573,7 +572,7 @@ exit 3
 	gotArgs := readLines(t, argsLog)
 	wantArgs := []string{
 		"--dangerously-skip-permissions --settings global-settings.json --settings settings.json --session-id " + sessionID + " --model sonnet --print original prompt",
-		"--dangerously-skip-permissions --settings global-settings.json --settings settings.json --session-id " + sessionID + " --model sonnet --resume " + sessionID + " " + resumeMessage,
+		"--dangerously-skip-permissions --settings global-settings.json --settings settings.json --model sonnet --resume " + sessionID + " " + resumeMessage,
 	}
 	if !reflect.DeepEqual(gotArgs, wantArgs) {
 		t.Fatalf("args got %#v, want %#v", gotArgs, wantArgs)
@@ -586,6 +585,145 @@ exit 3
 	}
 	if !ok || !strings.HasPrefix(title, "rl-2026-04-13-") {
 		t.Fatalf("expected generated title, ok=%v title=%q", ok, title)
+	}
+}
+
+func TestFindClaudeBinSkipsCmuxShim(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+
+	shimDir := filepath.Join(root, "T", "cmux-cli-shims", "ABC")
+	realDir := filepath.Join(root, ".local", "bin")
+	for _, d := range []string{shimDir, realDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shim := writeScript(t, shimDir, "claude", "#!/bin/sh\nexit 0\n")
+	real := writeScript(t, realDir, "claude", "#!/bin/sh\nexit 0\n")
+
+	// Shim directory comes first in PATH, mirroring the real failure.
+	pathEnv := strings.Join([]string{shimDir, realDir}, string(os.PathListSeparator))
+	got, err := findClaudeBin(pathEnv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != real {
+		t.Fatalf("findClaudeBin got %q, want real claude %q (shim was %q)", got, real, shim)
+	}
+}
+
+func TestFindCmuxShim(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	shimDir := filepath.Join(root, "cmux-cli-shims", "XYZ")
+	otherDir := filepath.Join(root, "bin")
+	for _, d := range []string{shimDir, otherDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	shim := writeScript(t, shimDir, "claude", "#!/bin/sh\nexit 0\n")
+	writeScript(t, otherDir, "claude", "#!/bin/sh\nexit 0\n")
+	pathEnv := strings.Join([]string{otherDir, shimDir}, string(os.PathListSeparator))
+
+	if got := findCmuxShim("", pathEnv); got != shim {
+		t.Fatalf("findCmuxShim(PATH) got %q, want %q", got, shim)
+	}
+	if got := findCmuxShim(shim, ""); got != shim {
+		t.Fatalf("findCmuxShim(pinned) got %q, want %q", got, shim)
+	}
+	if got := findCmuxShim("", otherDir); got != "" {
+		t.Fatalf("findCmuxShim without a shim dir got %q, want empty", got)
+	}
+}
+
+func TestArgsHaveCmuxHooks(t *testing.T) {
+	t.Parallel()
+	hooks := `{"hooks":{"SessionStart":[{"hooks":[{"command":"cmux hooks claude session-start"}]}]}}`
+	cases := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"separate flag", []string{"--settings", hooks, "--model", "sonnet"}, true},
+		{"inline flag", []string{"--settings=" + hooks}, true},
+		{"user settings file", []string{"--settings", "my-settings.json"}, false},
+		{"no settings", []string{"--dangerously-skip-permissions"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := argsHaveCmuxHooks(tc.args); got != tc.want {
+				t.Fatalf("argsHaveCmuxHooks(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveLaunch(t *testing.T) {
+	t.Parallel()
+	hooks := `{"hooks":{"Stop":[{"hooks":[{"command":"cmux hooks feed --source claude"}]}]}}`
+	base := config{ClaudeBin: "/real/claude", Env: []string{"PATH=/bin", "FOO=bar"}}
+
+	t.Run("no shim runs real claude", func(t *testing.T) {
+		bin, env := resolveLaunch(base, []string{"--dangerously-skip-permissions"})
+		if bin != base.ClaudeBin {
+			t.Fatalf("bin got %q, want %q", bin, base.ClaudeBin)
+		}
+		if !reflect.DeepEqual(env, base.Env) {
+			t.Fatalf("env got %v, want %v", env, base.Env)
+		}
+	})
+
+	t.Run("cmux already wrapped passes through to real claude", func(t *testing.T) {
+		cfg := base
+		cfg.CmuxShim = "/cmux/shim/claude"
+		bin, env := resolveLaunch(cfg, []string{"--settings", hooks})
+		if bin != cfg.ClaudeBin {
+			t.Fatalf("bin got %q, want real claude %q", bin, cfg.ClaudeBin)
+		}
+		for _, kv := range env {
+			if strings.HasPrefix(kv, "CMUX_CUSTOM_CLAUDE_PATH=") {
+				t.Fatalf("did not expect CMUX_CUSTOM_CLAUDE_PATH when already wrapped: %q", kv)
+			}
+		}
+	})
+
+	t.Run("self-wrap routes through shim pinned to real claude", func(t *testing.T) {
+		cfg := base
+		cfg.CmuxShim = "/cmux/shim/claude"
+		bin, env := resolveLaunch(cfg, []string{"--dangerously-skip-permissions"})
+		if bin != cfg.CmuxShim {
+			t.Fatalf("bin got %q, want shim %q", bin, cfg.CmuxShim)
+		}
+		want := "CMUX_CUSTOM_CLAUDE_PATH=" + cfg.ClaudeBin
+		found := false
+		for _, kv := range env {
+			if kv == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("env %v missing %q", env, want)
+		}
+	})
+}
+
+func TestSetEnvVarReplacesExisting(t *testing.T) {
+	t.Parallel()
+	env := []string{"A=1", "CMUX_CUSTOM_CLAUDE_PATH=/old", "B=2"}
+	got := setEnvVar(env, "CMUX_CUSTOM_CLAUDE_PATH", "/new")
+	want := []string{"A=1", "CMUX_CUSTOM_CLAUDE_PATH=/new", "B=2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("setEnvVar got %v, want %v", got, want)
+	}
+	// Original slice must be untouched.
+	if env[1] != "CMUX_CUSTOM_CLAUDE_PATH=/old" {
+		t.Fatalf("setEnvVar mutated input: %v", env)
+	}
+	got = setEnvVar([]string{"A=1"}, "NEW", "x")
+	if want := []string{"A=1", "NEW=x"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("setEnvVar append got %v, want %v", got, want)
 	}
 }
 
