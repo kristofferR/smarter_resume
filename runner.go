@@ -22,6 +22,8 @@ func run(ctx context.Context, cfg config, args []string) int {
 
 	resumeID := ""
 	lastExit := 0
+	extraBuffer := time.Duration(0)
+	var lastResumeAt time.Time
 	firstArgs := initialArgs(cfg.DefaultArgs, args, cfg.SkipPermissions)
 
 	for {
@@ -54,13 +56,22 @@ func run(ctx context.Context, cfg config, args []string) int {
 			startLine = preRunLines + 1
 		}
 
-		resetAt, ok, err := resetAfterRun(cfg, sessionFile, startLine)
+		resetAt, ok, err := resetAfterRun(cfg, sessionFile, startLine, runStarted)
 		if err != nil {
 			fmt.Fprintf(cfg.Stderr, "smarter_resume: parse reset time: %v\n", err)
 			return lastExit
 		}
 		if !ok {
 			return lastExit
+		}
+
+		// A limit detection shortly after a resume means the reset estimate
+		// was early or the resumed turn immediately re-hit the limit — back
+		// off instead of relaunching in a tight loop.
+		if !lastResumeAt.IsZero() && cfg.Now().Sub(lastResumeAt) < cfg.RelaunchGuardWindow {
+			extraBuffer = minDuration(extraBuffer*2+cfg.Buffer, maxExtraBuffer)
+		} else {
+			extraBuffer = 0
 		}
 
 		sessionID := sessionIDFromPath(sessionFile)
@@ -70,13 +81,42 @@ func run(ctx context.Context, cfg config, args []string) int {
 			return lastExit
 		}
 
-		wakeAt := resetAt.Add(cfg.Buffer)
-		printRateLimitBanner(cfg.Stderr, sessionName, resetAt, wakeAt, cfg.Buffer)
-		if !waitUntilWake(ctx, cfg, wakeAt, sessionID) {
+		buffer := cfg.Buffer + extraBuffer
+		wakeAt := resetAt.Add(buffer)
+		printRateLimitBanner(cfg.Stderr, sessionName, resetAt, wakeAt, buffer)
+		if !waitUntilLimitsLift(ctx, cfg, wakeAt, sessionID, runStarted, buffer) {
 			return cancelledWaitExitCode(lastExit)
 		}
 		printResumeBanner(cfg.Stderr, sessionName)
 		resumeID = sessionID
+		lastResumeAt = cfg.Now()
+	}
+}
+
+// maxExtraBuffer caps the back-off added on top of the configured buffer when
+// resumes re-hit the limit in quick succession.
+const maxExtraBuffer = 15 * time.Minute
+
+// waitUntilLimitsLift waits until wakeAt and then verifies against the
+// rate-limit snapshot that the limits actually lifted, extending the wait when
+// they did not. The snapshot's absolute reset epochs stay valid while claude
+// is not running, so a wrong or early transcript-parsed reset self-corrects
+// here instead of triggering a premature resume.
+func waitUntilLimitsLift(ctx context.Context, cfg config, wakeAt time.Time, sessionID string, runStarted time.Time, buffer time.Duration) bool {
+	for {
+		if !waitUntilWake(ctx, cfg, wakeAt, sessionID) {
+			return false
+		}
+		state, ok, err := loadRateLimitState(cfg.StateFile, cfg.WarnFile)
+		if err != nil || !ok || !state.fresh(runStarted) {
+			return true
+		}
+		until, blocked := state.blockedUntil(cfg.Now())
+		if !blocked {
+			return true
+		}
+		wakeAt = until.Add(buffer)
+		fmt.Fprintf(cfg.Stderr, "  Limits still exhausted; waiting until %s\n", wakeAt.Format("15:04:05 MST"))
 	}
 }
 
@@ -92,9 +132,17 @@ func snapshotLatestSession(projectsDir string, cwd string) (string, int) {
 	return path, lines
 }
 
-func resetAfterRun(cfg config, sessionFile string, startLine int) (time.Time, bool, error) {
-	if reset, ok, err := resetFromWarnFile(cfg.WarnFile); err != nil || ok {
-		return reset, ok, err
+// resetAfterRun decides whether the run that just ended hit a usage limit and
+// when it lifts. The statusline snapshot is the primary signal: it carries
+// exact utilization and reset epochs, so a limit is only declared when a
+// bucket actually reached 100%. The transcript text is the fallback — the
+// snapshot can lag the final rate-limited request by one render, or be
+// missing entirely on older statusline versions.
+func resetAfterRun(cfg config, sessionFile string, startLine int, runStarted time.Time) (time.Time, bool, error) {
+	if state, ok, err := loadRateLimitState(cfg.StateFile, cfg.WarnFile); err == nil && ok && state.fresh(runStarted) {
+		if until, blocked := state.blockedUntil(cfg.Now()); blocked {
+			return until, true, nil
+		}
 	}
 
 	info, ok, err := findResetInfo(sessionFile, startLine)
@@ -102,9 +150,28 @@ func resetAfterRun(cfg config, sessionFile string, startLine int) (time.Time, bo
 		return time.Time{}, ok, err
 	}
 
-	reset, err := parseResetTime(info.Text, info.TZ, cfg.Now())
+	// Anchor ambiguous times ("resets 3pm") to the moment the notice was
+	// written, not the moment claude exited — the session may have continued
+	// long past the notice.
+	ref := info.When
+	if ref.IsZero() {
+		ref = cfg.Now()
+	}
+	reset, err := parseResetTime(info.Text, info.TZ, ref)
 	if err != nil {
 		return time.Time{}, false, err
+	}
+
+	now := cfg.Now()
+	if !reset.After(now) {
+		if now.Sub(reset) <= resetGraceWindow {
+			// The reset passed while claude was shutting down — it already
+			// lifted, resume immediately.
+			return now, true, nil
+		}
+		// The limit lifted long before claude exited, so the session was
+		// waited out or continued — this exit was not limit-caused.
+		return time.Time{}, false, nil
 	}
 	return reset, true, nil
 }
@@ -287,85 +354,104 @@ func shouldForwardInterrupt(process *os.Process) bool {
 	return childPGID != syscall.Getpgrp()
 }
 
+// watchForRateLimit ends the run early once a usage limit is hit so the wait
+// starts immediately instead of after the user notices a stalled session. Each
+// tick it polls the rate-limit snapshot (which needs no session file), keeps
+// trying to resolve this run's session file, and scans new transcript lines.
 func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.Process, runStarted time.Time, preRunFile string, preRunLines int) {
-	sessionFile, ok := waitForSessionFile(ctx, cfg, cwd, runStarted, preRunFile, preRunLines)
-	if !ok {
-		return
-	}
-
-	baseline := 0
-	if sessionFile == preRunFile {
-		baseline = preRunLines
-	}
-	if signalIfRateLimited(ctx, cfg, process, sessionFile, baseline+1) {
-		return
-	}
-	current, err := countLines(sessionFile)
-	if err != nil {
-		return
-	}
-	if current > baseline {
-		baseline = current
-	}
-
 	ticker := time.NewTicker(cfg.WatchInterval)
 	defer ticker.Stop()
 
+	sessionFile := ""
+	baseline := 0
+
 	for {
+		if stateSaysBlocked(cfg, runStarted) {
+			settleThenTerminate(ctx, cfg, process)
+			return
+		}
+
+		if sessionFile == "" {
+			if file, ok, err := findRunSession(cfg.ProjectsDir, cwd, runStarted, preRunFile, preRunLines); err == nil && ok {
+				sessionFile = file
+				if sessionFile == preRunFile {
+					baseline = preRunLines
+				}
+			}
+		}
+
+		if sessionFile != "" {
+			current, err := countLines(sessionFile)
+			if err == nil && current > baseline {
+				if _, ok, err := findResetInfo(sessionFile, baseline+1); err == nil && ok {
+					settleThenTerminate(ctx, cfg, process)
+					return
+				}
+				baseline = current
+			}
+		}
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			current, err := countLines(sessionFile)
-			if err != nil {
-				return
-			}
-			if current <= baseline {
-				continue
-			}
-			if signalIfRateLimited(ctx, cfg, process, sessionFile, baseline+1) {
-				return
-			}
-			baseline = current
 		}
 	}
 }
 
-func signalIfRateLimited(ctx context.Context, cfg config, process *os.Process, sessionFile string, startLine int) bool {
-	if _, ok, err := findResetInfo(sessionFile, startLine); err != nil || !ok {
+func stateSaysBlocked(cfg config, runStarted time.Time) bool {
+	state, ok, err := loadRateLimitState(cfg.StateFile, cfg.WarnFile)
+	if err != nil || !ok || !state.fresh(runStarted) {
 		return false
 	}
+	_, blocked := state.blockedUntil(cfg.Now())
+	return blocked
+}
+
+// settleThenTerminate gives claude a moment to finish writing the limit notice
+// before termination begins.
+func settleThenTerminate(ctx context.Context, cfg config, process *os.Process) {
 	if cfg.WatchSettle > 0 {
 		timer := time.NewTimer(cfg.WatchSettle)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return true
+			return
 		case <-timer.C:
 		}
 	}
-	_ = process.Signal(os.Interrupt)
-	return true
+	terminateClaude(ctx, cfg, process)
 }
 
-func waitForSessionFile(ctx context.Context, cfg config, cwd string, runStarted time.Time, preRunFile string, preRunLines int) (string, bool) {
-	deadline := time.NewTimer(cfg.WatchTimeout)
-	defer deadline.Stop()
-
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		if sessionFile, ok, err := findRunSession(cfg.ProjectsDir, cwd, runStarted, preRunFile, preRunLines); err == nil && ok {
-			return sessionFile, true
+// terminateClaude escalates until the child exits. Interactive claude treats a
+// single Ctrl-C as "cancel the current input" and only quits on a second one
+// shortly after, so a lone SIGINT would leave the wrapper blocked in cmd.Wait
+// forever. ctx is cancelled as soon as cmd.Wait returns, which aborts the
+// escalation at the first sign of exit.
+func terminateClaude(ctx context.Context, cfg config, process *os.Process) {
+	steps := []struct {
+		sig  os.Signal
+		wait time.Duration
+	}{
+		{os.Interrupt, cfg.InterruptRepeat},
+		{os.Interrupt, cfg.InterruptGrace},
+		{syscall.SIGTERM, cfg.TermGrace},
+		{os.Kill, 0},
+	}
+	for _, step := range steps {
+		if ctx.Err() != nil {
+			return
 		}
-
+		_ = process.Signal(step.sig)
+		if step.wait <= 0 {
+			continue
+		}
+		timer := time.NewTimer(step.wait)
 		select {
 		case <-ctx.Done():
-			return "", false
-		case <-deadline.C:
-			return "", false
-		case <-ticker.C:
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 	}
 }

@@ -15,9 +15,21 @@ import (
 type resetInfo struct {
 	Text string
 	TZ   string
+	// When is the timestamp of the transcript record carrying the limit
+	// notice, when the record has one. Zero otherwise.
+	When time.Time
 }
 
-var resetPattern = regexp.MustCompile(`(?i)\breset(?:s)?(?:\s+at)?\s+([^(]+?)\s*\(([^)]+)\)`)
+// resetPattern extracts "resets <time>" phrases: an optional date, a 12- or
+// 24-hour time, and a timezone that may be parenthesized ("(America/Oslo)"),
+// a bare abbreviation ("PST", case-sensitive so prose words never match), an
+// offset ("UTC+2"), or absent entirely (the machine's local zone is assumed).
+var resetPattern = regexp.MustCompile(
+	`(?i)\breset(?:s)?(?:\s+at)?[:\s]+` +
+		`((?:[A-Za-z]{3,9}\.?\s+\d{1,2}(?:,\s*\d{4})?,?\s+)?` + // optional date
+		`(?:\d{1,2}(?::\d{2})?\s*[ap]\.?m\.?|\d{1,2}:\d{2}))` + // 12h or 24h time
+		`\s*(?:\(([^)]+)\)|((?-i:(?:UTC|GMT)[+-]\d{1,2}(?::\d{2})?|[A-Z]{2,5}))\b)?`)
+
 var claudeProjectSlugPattern = regexp.MustCompile(`[^A-Za-z0-9]+`)
 
 func encodedCWD(cwd string) string {
@@ -32,20 +44,51 @@ func findLatestSession(projectsDir string, cwd string) (string, bool, error) {
 func findLatestSessionAfter(projectsDir string, cwd string, minModTime time.Time) (string, bool, error) {
 	sessionDir := filepath.Join(projectsDir, encodedCWD(cwd))
 	if info, err := os.Stat(sessionDir); err == nil && info.IsDir() {
-		path, ok, err := newestJSONLAfter(sessionDir, 1, minModTime)
+		path, ok, err := newestJSONLAfter(sessionDir, 1, minModTime, nil)
 		if err != nil || ok {
 			return path, ok, err
 		}
 	}
 
-	return newestJSONLAfter(projectsDir, 2, minModTime)
+	// The fallback scans every project dir (worktrees encode to different
+	// slugs), so a concurrent session in an unrelated project can be the
+	// newest file — require the transcript to name this run's cwd.
+	return newestJSONLAfter(projectsDir, 2, minModTime, func(path string) bool {
+		return sessionFileMatchesCWD(path, cwd)
+	})
 }
 
-func newestJSONL(root string, maxDepth int) (string, bool, error) {
-	return newestJSONLAfter(root, maxDepth, time.Time{})
+// sessionFileMatchesCWD reports whether the transcript at path belongs to a
+// session started in cwd. Claude records a top-level "cwd" field on most
+// entries; files that never name a cwd within the first records are accepted
+// so synthetic or trimmed transcripts keep working.
+func sessionFileMatchesCWD(path string, cwd string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	want := filepath.Clean(cwd)
+	reader := bufio.NewReader(f)
+	for i := 0; i < 25; i++ {
+		line, err := reader.ReadBytes('\n')
+		if len(strings.TrimSpace(string(line))) > 0 {
+			var obj struct {
+				CWD string `json:"cwd"`
+			}
+			if json.Unmarshal(line, &obj) == nil && obj.CWD != "" {
+				return filepath.Clean(obj.CWD) == want
+			}
+		}
+		if err != nil {
+			return true
+		}
+	}
+	return true
 }
 
-func newestJSONLAfter(root string, maxDepth int, minModTime time.Time) (string, bool, error) {
+func newestJSONLAfter(root string, maxDepth int, minModTime time.Time, match func(string) bool) (string, bool, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -85,10 +128,14 @@ func newestJSONLAfter(root string, maxDepth int, minModTime time.Time) (string, 
 		if !minModTime.IsZero() && info.ModTime().Before(minModTime) {
 			return nil
 		}
-		if newest == "" || info.ModTime().After(newestMod) {
-			newest = path
-			newestMod = info.ModTime()
+		if newest != "" && !info.ModTime().After(newestMod) {
+			return nil
 		}
+		if match != nil && !match(path) {
+			return nil
+		}
+		newest = path
+		newestMod = info.ModTime()
 		return nil
 	})
 	if err != nil {
@@ -223,33 +270,55 @@ func resetInfoFromJSONLine(line []byte) (resetInfo, bool) {
 
 	var latest resetInfo
 	found := false
-	for _, s := range resetCandidateStrings(obj) {
+	for _, s := range collectJSONStrings(obj, nil, 0) {
 		if info, ok := resetInfoFromText(s); ok {
 			latest = info
 			found = true
 		}
 	}
+	if found {
+		latest.When = recordTimestamp(obj)
+	}
 	return latest, found
 }
 
-func resetCandidateStrings(obj map[string]any) []string {
-	recordType, _ := obj["type"].(string)
-	if recordType == "user" || recordType == "assistant" {
-		return nil
-	}
+const (
+	maxScanDepth   = 8
+	maxScanStrings = 200
+)
 
-	keys := []string{"message", "error", "status", "stderr"}
-	if recordType == "error" || recordType == "system" || recordType == "result" {
-		keys = append(keys, "content", "text")
+// collectJSONStrings gathers every string value anywhere in v. Limit notices
+// land in different shapes across claude versions — flat "message"/"error"
+// fields, or nested message.content[].text on user/assistant records — so no
+// record type or key is privileged.
+func collectJSONStrings(v any, out []string, depth int) []string {
+	if depth > maxScanDepth || len(out) >= maxScanStrings {
+		return out
 	}
-
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		if value, ok := obj[key].(string); ok {
-			out = append(out, value)
+	switch t := v.(type) {
+	case string:
+		out = append(out, t)
+	case map[string]any:
+		for _, val := range t {
+			out = collectJSONStrings(val, out, depth+1)
+		}
+	case []any:
+		for _, val := range t {
+			out = collectJSONStrings(val, out, depth+1)
 		}
 	}
 	return out
+}
+
+func recordTimestamp(obj map[string]any) time.Time {
+	raw, _ := obj["timestamp"].(string)
+	if raw == "" {
+		return time.Time{}
+	}
+	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+		return ts
+	}
+	return time.Time{}
 }
 
 func resetInfoFromText(text string) (resetInfo, bool) {
@@ -258,9 +327,13 @@ func resetInfoFromText(text string) (resetInfo, bool) {
 		return resetInfo{}, false
 	}
 	last := matches[len(matches)-1]
+	tz := strings.TrimSpace(last[2])
+	if tz == "" {
+		tz = strings.TrimSpace(last[3])
+	}
 	return resetInfo{
 		Text: strings.TrimSpace(last[1]),
-		TZ:   strings.TrimSpace(last[2]),
+		TZ:   tz,
 	}, true
 }
 

@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,35 +13,117 @@ import (
 
 var ampmPattern = regexp.MustCompile(`(?i)\b([0-9]{1,2})(?::([0-9]{2}))?\s*([ap])\.?m\.?\b`)
 var timeOnlyPattern = regexp.MustCompile(`^[0-9]{1,2}:[0-9]{2}[AP]M$`)
+var timeOnly24Pattern = regexp.MustCompile(`^([01]?[0-9]|2[0-3]):[0-5][0-9]$`)
+var tzOffsetPattern = regexp.MustCompile(`^(?:UTC|GMT)?([+-])([0-9]{1,2})(?::?([0-9]{2}))?$`)
+
+// resetGraceWindow treats a reset time slightly in the past as "already
+// lifted" instead of rolling it a full day forward — the transcript is parsed
+// after claude exits, which can be minutes after the notice was printed.
+const resetGraceWindow = 15 * time.Minute
+
+// tzAbbreviations maps common abbreviations in claude's limit notices to IANA
+// zones. Go's tzdata only resolves a few legacy names (EST, CET, ...) and
+// those lack DST rules, so prefer real zones. IST is ambiguous
+// (India/Ireland/Israel); India is by far the most common in practice.
+var tzAbbreviations = map[string]string{
+	"PT":   "America/Los_Angeles",
+	"PST":  "America/Los_Angeles",
+	"PDT":  "America/Los_Angeles",
+	"MT":   "America/Denver",
+	"MST":  "America/Denver",
+	"MDT":  "America/Denver",
+	"CT":   "America/Chicago",
+	"CST":  "America/Chicago",
+	"CDT":  "America/Chicago",
+	"ET":   "America/New_York",
+	"EST":  "America/New_York",
+	"EDT":  "America/New_York",
+	"AKST": "America/Anchorage",
+	"AKDT": "America/Anchorage",
+	"HST":  "Pacific/Honolulu",
+	"BST":  "Europe/London",
+	"CET":  "Europe/Paris",
+	"CEST": "Europe/Paris",
+	"EET":  "Europe/Helsinki",
+	"EEST": "Europe/Helsinki",
+	"AEST": "Australia/Sydney",
+	"AEDT": "Australia/Sydney",
+	"IST":  "Asia/Kolkata",
+	"JST":  "Asia/Tokyo",
+	"Z":    "UTC",
+	"UTC":  "UTC",
+	"GMT":  "UTC",
+}
+
+// resolveLocation turns whatever timezone text the limit notice carried into a
+// usable location. It never fails: an unknown zone falls back to the machine's
+// local zone — resuming slightly off beats never resuming, and the wake-time
+// verification against the rate-limit snapshot corrects an early guess.
+func resolveLocation(tz string) *time.Location {
+	tz = strings.TrimSpace(tz)
+	if tz == "" {
+		return time.Local
+	}
+	if name, ok := tzAbbreviations[strings.ToUpper(tz)]; ok {
+		if loc, err := time.LoadLocation(name); err == nil {
+			return loc
+		}
+	}
+	if m := tzOffsetPattern.FindStringSubmatch(strings.ToUpper(tz)); m != nil {
+		hours, _ := strconv.Atoi(m[2])
+		mins := 0
+		if m[3] != "" {
+			mins, _ = strconv.Atoi(m[3])
+		}
+		offset := hours*3600 + mins*60
+		if m[1] == "-" {
+			offset = -offset
+		}
+		return time.FixedZone(tz, offset)
+	}
+	if loc, err := time.LoadLocation(tz); err == nil {
+		return loc
+	}
+	return time.Local
+}
 
 func parseResetTime(text string, tz string, now time.Time) (time.Time, error) {
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("load timezone %q: %w", tz, err)
-	}
+	loc := resolveLocation(tz)
 
 	resetText := normalizeResetText(text)
 	nowInLoc := now.In(loc)
 
-	if timeOnlyPattern.MatchString(resetText) {
-		tod, err := time.ParseInLocation("3:04PM", resetText, loc)
+	layout := ""
+	switch {
+	case timeOnlyPattern.MatchString(resetText):
+		layout = "3:04PM"
+	case timeOnly24Pattern.MatchString(resetText):
+		layout = "15:04"
+	}
+	if layout != "" {
+		tod, err := time.ParseInLocation(layout, resetText, loc)
 		if err != nil {
 			return time.Time{}, err
 		}
 		reset := time.Date(nowInLoc.Year(), nowInLoc.Month(), nowInLoc.Day(), tod.Hour(), tod.Minute(), 0, 0, loc)
 		if !reset.After(nowInLoc) {
+			if nowInLoc.Sub(reset) <= resetGraceWindow {
+				// The reset just passed while we were parsing — it already
+				// lifted, so wake immediately instead of waiting a day.
+				return nowInLoc, nil
+			}
 			reset = reset.AddDate(0, 0, 1)
 		}
 		return reset, nil
 	}
 
-	type layout struct {
+	type layoutCandidate struct {
 		parseLayout string
 		value       string
 		rollYear    bool
 	}
 
-	layouts := []layout{
+	layouts := []layoutCandidate{
 		{parseLayout: "Jan 2, 2006 3:04PM", value: resetText},
 		{parseLayout: "Jan 2 2006 3:04PM", value: resetText},
 		{parseLayout: "January 2, 2006 3:04PM", value: resetText},
@@ -65,6 +145,9 @@ func parseResetTime(text string, tz string, now time.Time) (time.Time, error) {
 			reset = reset.AddDate(1, 0, 0)
 		}
 		if !reset.After(nowInLoc) {
+			if nowInLoc.Sub(reset) <= resetGraceWindow {
+				return nowInLoc, nil
+			}
 			return time.Time{}, fmt.Errorf("reset time %q is not in the future", text)
 		}
 		return reset, nil
@@ -89,54 +172,4 @@ func normalizeResetText(text string) string {
 		}
 		return parts[1] + ":" + minute + strings.ToUpper(parts[3]) + "M"
 	})
-}
-
-func resetFromWarnFile(path string) (time.Time, bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return time.Time{}, false, nil
-		}
-		return time.Time{}, false, err
-	}
-	defer f.Close()
-
-	values := map[string]int64{}
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		key, raw, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-		if err != nil {
-			continue
-		}
-		values[strings.TrimSpace(key)] = n
-	}
-	if err := scanner.Err(); err != nil {
-		return time.Time{}, false, err
-	}
-
-	pct5h := values["5h_pct"]
-	pct7d := values["7d_pct"]
-	reset5h := values["5h_reset"]
-	reset7d := values["7d_reset"]
-
-	var epoch int64
-	switch {
-	case pct5h > pct7d:
-		epoch = reset5h
-	case pct7d > pct5h:
-		epoch = reset7d
-	case reset7d > reset5h:
-		epoch = reset7d
-	default:
-		epoch = reset5h
-	}
-	if epoch <= 0 {
-		return time.Time{}, false, nil
-	}
-	return time.Unix(epoch, 0), true, nil
 }

@@ -20,21 +20,25 @@ const (
 )
 
 type config struct {
-	ClaudeBin       string
-	CmuxShim        string
-	ProjectsDir     string
-	WarnFile        string
-	DefaultArgs     []string
-	Buffer          time.Duration
-	SkipPermissions bool
-	WatchInterval   time.Duration
-	WatchTimeout    time.Duration
-	WatchSettle     time.Duration
-	Stdin           io.Reader
-	Stdout          io.Writer
-	Stderr          io.Writer
-	Env             []string
-	Now             func() time.Time
+	ClaudeBin           string
+	CmuxShim            string
+	ProjectsDir         string
+	WarnFile            string
+	StateFile           string
+	DefaultArgs         []string
+	Buffer              time.Duration
+	SkipPermissions     bool
+	WatchInterval       time.Duration
+	WatchSettle         time.Duration
+	InterruptRepeat     time.Duration
+	InterruptGrace      time.Duration
+	TermGrace           time.Duration
+	RelaunchGuardWindow time.Duration
+	Stdin               io.Reader
+	Stdout              io.Writer
+	Stderr              io.Writer
+	Env                 []string
+	Now                 func() time.Time
 }
 
 func loadConfig() (config, error) {
@@ -90,21 +94,25 @@ func loadConfig() (config, error) {
 	}
 
 	return config{
-		ClaudeBin:       claudeBin,
-		CmuxShim:        cmuxShim,
-		ProjectsDir:     projectsDir,
-		WarnFile:        filepath.Join(claudeConfigDir, ".rl_warn"),
-		DefaultArgs:     defaultArgs,
-		Buffer:          time.Duration(bufferSecs) * time.Second,
-		SkipPermissions: boolEnv("CLAUDE_SMART_RESUME_SKIP_PERMISSIONS"),
-		WatchInterval:   time.Duration(watchSecs) * time.Second,
-		WatchTimeout:    30 * time.Second,
-		WatchSettle:     300 * time.Millisecond,
-		Stdin:           os.Stdin,
-		Stdout:          os.Stdout,
-		Stderr:          os.Stderr,
-		Env:             os.Environ(),
-		Now:             time.Now,
+		ClaudeBin:           claudeBin,
+		CmuxShim:            cmuxShim,
+		ProjectsDir:         projectsDir,
+		WarnFile:            filepath.Join(claudeConfigDir, ".rl_warn"),
+		StateFile:           filepath.Join(claudeConfigDir, ".rate_limits"),
+		DefaultArgs:         defaultArgs,
+		Buffer:              time.Duration(bufferSecs) * time.Second,
+		SkipPermissions:     boolEnv("CLAUDE_SMART_RESUME_SKIP_PERMISSIONS"),
+		WatchInterval:       time.Duration(watchSecs) * time.Second,
+		WatchSettle:         300 * time.Millisecond,
+		InterruptRepeat:     300 * time.Millisecond,
+		InterruptGrace:      5 * time.Second,
+		TermGrace:           2 * time.Second,
+		RelaunchGuardWindow: 2 * time.Minute,
+		Stdin:               os.Stdin,
+		Stdout:              os.Stdout,
+		Stderr:              os.Stderr,
+		Env:                 os.Environ(),
+		Now:                 time.Now,
 	}, nil
 }
 

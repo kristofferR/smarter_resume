@@ -42,6 +42,64 @@ func TestFindResetInfoUsesJSONAndStartLine(t *testing.T) {
 	}
 }
 
+func TestFindResetInfoReadsNestedAssistantRecords(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	content := `{"type":"assistant","timestamp":"2026-04-13T10:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"5-hour limit reached. Your limit will reset at 3:00pm (America/Santiago)."}]}}` + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	info, ok, err := findResetInfo(path, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected nested assistant limit notice to be detected")
+	}
+	if info.Text != "3:00pm" || info.TZ != "America/Santiago" {
+		t.Fatalf("unexpected reset info: %#v", info)
+	}
+	if want := time.Date(2026, time.April, 13, 10, 0, 0, 0, time.UTC); !info.When.Equal(want) {
+		t.Fatalf("record timestamp got %s, want %s", info.When, want)
+	}
+}
+
+func TestResetInfoFromTextVariants(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		text     string
+		wantText string
+		wantTZ   string
+		wantOK   bool
+	}{
+		{"parenthesized IANA", "Your limit will reset at 3:00pm (America/Santiago)", "3:00pm", "America/Santiago", true},
+		{"bare abbreviation", "resets 5:30pm PST", "5:30pm", "PST", true},
+		{"bare offset", "resets at 11pm UTC+2", "11pm", "UTC+2", true},
+		{"no timezone", "limit reached - resets 3am", "3am", "", true},
+		{"24 hour clock", "resets at 17:30", "17:30", "", true},
+		{"colon separator", "reset: 6:00pm (UTC)", "6:00pm", "UTC", true},
+		{"date with year", "resets Apr 14, 2026 11:30pm (America/New_York).", "Apr 14, 2026 11:30pm", "America/New_York", true},
+		{"prose word not a timezone", "resets 3:00pm today", "3:00pm", "", true},
+		{"no time", "the counter resets whenever", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info, ok := resetInfoFromText(tt.text)
+			if ok != tt.wantOK {
+				t.Fatalf("ok got %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if info.Text != tt.wantText || info.TZ != tt.wantTZ {
+				t.Fatalf("got text=%q tz=%q, want text=%q tz=%q", info.Text, info.TZ, tt.wantText, tt.wantTZ)
+			}
+		})
+	}
+}
+
 func TestSessionTitleAndAppendRoundTrip(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "session.jsonl")
@@ -139,6 +197,242 @@ func TestParseResetTime(t *testing.T) {
 	}
 	if _, err := parseResetTime("not-a-time", "UTC", now); err == nil {
 		t.Fatal("expected invalid time to fail")
+	}
+}
+
+func TestParseResetTimeExtendedFormats(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.April, 13, 12, 0, 0, 0, time.UTC)
+
+	got, err := parseResetTime("17:30", "UTC", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2026, time.April, 13, 17, 30, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("24h got %s, want %s", got, want)
+	}
+
+	la := mustLocation(t, "America/Los_Angeles")
+	got, err = parseResetTime("5pm", "PST", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2026, time.April, 13, 17, 0, 0, 0, la); !got.Equal(want) {
+		t.Fatalf("PST got %s, want %s", got, want)
+	}
+
+	got, err = parseResetTime("3pm", "UTC+2", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3pm UTC+2 == 1pm UTC on the same day.
+	if want := time.Date(2026, time.April, 13, 13, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("UTC+2 got %s, want %s", got, want)
+	}
+
+	// A reset a few minutes in the past means it just lifted — wake now
+	// instead of rolling a full day forward.
+	got, err = parseResetTime("11:50am", "UTC", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Equal(now) {
+		t.Fatalf("grace window got %s, want %s", got, now)
+	}
+}
+
+func TestResetAfterRunDecisions(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.April, 13, 18, 0, 0, 0, time.UTC)
+	newCfg := func(dir string) config {
+		return config{
+			StateFile: filepath.Join(dir, ".rate_limits"),
+			WarnFile:  filepath.Join(dir, ".rl_warn"),
+			Now:       func() time.Time { return now },
+		}
+	}
+	writeSession := func(t *testing.T, dir string, lines ...string) string {
+		t.Helper()
+		path := filepath.Join(dir, "session.jsonl")
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	t.Run("stale snapshot is ignored", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := newCfg(dir)
+		content := "written_at=" + strconvFormat(now.Add(-2*time.Hour).Unix()) +
+			"\n5h_pct=100\n5h_reset=" + strconvFormat(now.Add(time.Hour).Unix()) + "\n"
+		if err := os.WriteFile(cfg.StateFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		session := writeSession(t, dir, `{"type":"message","content":"no limits here"}`)
+
+		_, ok, err := resetAfterRun(cfg, session, 1, now.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("snapshot written before the run must not trigger a resume")
+		}
+	})
+
+	t.Run("transcript notice anchored to its own timestamp", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := newCfg(dir)
+		// Notice at 10:00 saying "resets 3pm"; claude exited at 18:00 — the
+		// limit lifted hours ago, the session simply continued past it.
+		session := writeSession(t, dir,
+			`{"type":"assistant","timestamp":"2026-04-13T10:00:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 3pm (UTC)"}]}}`)
+
+		_, ok, err := resetAfterRun(cfg, session, 1, now.Add(-9*time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("a limit that lifted long before exit must not schedule a resume")
+		}
+	})
+
+	t.Run("active limit from transcript resumes at parsed time", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := newCfg(dir)
+		session := writeSession(t, dir,
+			`{"type":"assistant","timestamp":"2026-04-13T17:55:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 9pm (UTC)"}]}}`)
+
+		reset, ok, err := resetAfterRun(cfg, session, 1, now.Add(-time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := time.Date(2026, time.April, 13, 21, 0, 0, 0, time.UTC)
+		if !ok || !reset.Equal(want) {
+			t.Fatalf("got ok=%v reset=%s, want %s", ok, reset, want)
+		}
+	})
+
+	t.Run("fresh exhausted snapshot wins over transcript", func(t *testing.T) {
+		dir := t.TempDir()
+		cfg := newCfg(dir)
+		until := now.Add(45 * time.Minute)
+		content := "written_at=" + strconvFormat(now.Unix()) +
+			"\n5h_pct=100\n5h_reset=" + strconvFormat(until.Unix()) + "\n"
+		if err := os.WriteFile(cfg.StateFile, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		session := writeSession(t, dir, `{"type":"message","content":"irrelevant"}`)
+
+		reset, ok, err := resetAfterRun(cfg, session, 1, now.Add(-time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok || reset.Unix() != until.Unix() {
+			t.Fatalf("got ok=%v reset=%d, want %d", ok, reset.Unix(), until.Unix())
+		}
+	})
+}
+
+func TestSessionFileMatchesCWD(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cwd := filepath.Join(string(filepath.Separator), "tmp", "some", "project")
+
+	matching := filepath.Join(dir, "matching.jsonl")
+	if err := os.WriteFile(matching, []byte(`{"type":"user","cwd":"`+strings.ReplaceAll(cwd, `\`, `\\`)+`"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	foreign := filepath.Join(dir, "foreign.jsonl")
+	if err := os.WriteFile(foreign, []byte(`{"type":"user","cwd":"/somewhere/else"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	noCWD := filepath.Join(dir, "nocwd.jsonl")
+	if err := os.WriteFile(noCWD, []byte(`{"type":"custom-title","customTitle":"x"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !sessionFileMatchesCWD(matching, cwd) {
+		t.Fatal("matching cwd rejected")
+	}
+	if sessionFileMatchesCWD(foreign, cwd) {
+		t.Fatal("foreign cwd accepted")
+	}
+	if !sessionFileMatchesCWD(noCWD, cwd) {
+		t.Fatal("cwd-less transcript must be accepted")
+	}
+}
+
+func TestFindLatestSessionFallbackSkipsForeignProjects(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cwd := filepath.Join(string(filepath.Separator), "tmp", "some", "project")
+
+	// No per-project dir exists, so discovery falls back to scanning all
+	// projects. The newest file belongs to another project and must lose to
+	// the older file that names this cwd.
+	foreignDir := filepath.Join(dir, "-other-project")
+	ownDir := filepath.Join(dir, "-tmp-some-project-worktree")
+	for _, d := range []string{foreignDir, ownDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	foreign := filepath.Join(foreignDir, "foreign.jsonl")
+	if err := os.WriteFile(foreign, []byte(`{"type":"user","cwd":"/other/project"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	own := filepath.Join(ownDir, "own.jsonl")
+	if err := os.WriteFile(own, []byte(`{"type":"user","cwd":"`+strings.ReplaceAll(cwd, `\`, `\\`)+`"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(own, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(foreign, base.Add(time.Hour), base.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := findLatestSessionAfter(dir, cwd, time.Time{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != own {
+		t.Fatalf("got ok=%v path=%q, want %q", ok, got, own)
+	}
+}
+
+func TestWaitUntilLimitsLiftExtendsWhileBlocked(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	var stderr bytes.Buffer
+	cfg := config{
+		StateFile: filepath.Join(dir, ".rate_limits"),
+		WarnFile:  filepath.Join(dir, ".rl_warn"),
+		Stderr:    &stderr,
+		Now:       time.Now,
+	}
+
+	start := time.Now()
+	// Unix() truncates to whole seconds, so +2s guarantees the effective
+	// blocked-until instant is at least one full second in the future.
+	until := start.Add(2 * time.Second)
+	content := "written_at=" + strconvFormat(start.Unix()) +
+		"\n5h_pct=100\n5h_reset=" + strconvFormat(until.Unix()) + "\n"
+	if err := os.WriteFile(cfg.StateFile, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// wakeAt is already in the past; the snapshot says the limit lifts later,
+	// so the wait must extend instead of resuming early.
+	if !waitUntilLimitsLift(context.Background(), cfg, start, "session", start.Add(-time.Second), 0) {
+		t.Fatal("expected wait to complete")
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("resumed after %s despite limits blocked until +2s", elapsed)
+	}
+	if !strings.Contains(stderr.String(), "Limits still exhausted") {
+		t.Fatalf("expected extension notice, stderr: %q", stderr.String())
 	}
 }
 
@@ -271,45 +565,128 @@ func TestFindRunSessionFallsBackToGrownExistingSession(t *testing.T) {
 	}
 }
 
-func TestWarnFileSelection(t *testing.T) {
+func TestRateLimitStateBlockedUntil(t *testing.T) {
 	t.Parallel()
-	path := filepath.Join(t.TempDir(), ".rl_warn")
+	now := time.Date(2026, time.April, 13, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name        string
+		state       rateLimitState
+		wantBlocked bool
+		wantUntil   time.Time
+	}{
+		{
+			name: "approaching limit does not block",
+			state: rateLimitState{
+				FiveHour: rlBucket{Pct: 91, Reset: now.Add(30 * time.Minute)},
+				SevenDay: rlBucket{Pct: 95, Reset: now.Add(time.Hour)},
+			},
+			wantBlocked: false,
+		},
+		{
+			name: "exhausted bucket blocks until its reset",
+			state: rateLimitState{
+				FiveHour: rlBucket{Pct: 100, Reset: now.Add(30 * time.Minute)},
+				SevenDay: rlBucket{Pct: 42, Reset: now.Add(24 * time.Hour)},
+			},
+			wantBlocked: true,
+			wantUntil:   now.Add(30 * time.Minute),
+		},
+		{
+			name: "both exhausted blocks until the later reset",
+			state: rateLimitState{
+				FiveHour: rlBucket{Pct: 100, Reset: now.Add(30 * time.Minute)},
+				SevenDay: rlBucket{Pct: 100.4, Reset: now.Add(2 * time.Hour)},
+			},
+			wantBlocked: true,
+			wantUntil:   now.Add(2 * time.Hour),
+		},
+		{
+			name: "exhausted bucket with past reset does not block",
+			state: rateLimitState{
+				FiveHour: rlBucket{Pct: 100, Reset: now.Add(-time.Minute)},
+			},
+			wantBlocked: false,
+		},
+		{
+			name: "seven day exhausted while five hour merely high",
+			state: rateLimitState{
+				FiveHour: rlBucket{Pct: 97, Reset: now.Add(30 * time.Minute)},
+				SevenDay: rlBucket{Pct: 100, Reset: now.Add(48 * time.Hour)},
+			},
+			wantBlocked: true,
+			wantUntil:   now.Add(48 * time.Hour),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			until, blocked := tt.state.blockedUntil(now)
+			if blocked != tt.wantBlocked {
+				t.Fatalf("blocked got %v, want %v", blocked, tt.wantBlocked)
+			}
+			if blocked && !until.Equal(tt.wantUntil) {
+				t.Fatalf("until got %s, want %s", until, tt.wantUntil)
+			}
+		})
+	}
+}
+
+func TestLoadRateLimitStateFallsBackToLegacyWarnFile(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	stateFile := filepath.Join(dir, ".rate_limits")
+	warnFile := filepath.Join(dir, ".rl_warn")
 	now := time.Now().Unix()
-	content := strings.Join([]string{
-		"5h_pct=80",
+
+	// Legacy warn file written at a 95% warning threshold: present, but must
+	// NOT read as blocked — this was the premature-resume bug.
+	legacy := strings.Join([]string{
+		"5h_pct=95",
 		"5h_reset=" + strconvFormat(now+1800),
-		"7d_pct=95",
+		"7d_pct=10",
 		"7d_reset=" + strconvFormat(now+3600),
 	}, "\n")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+	if err := os.WriteFile(warnFile, []byte(legacy), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err := resetFromWarnFile(path)
+	state, ok, err := loadRateLimitState(stateFile, warnFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || got.Unix() != now+3600 {
-		t.Fatalf("got ok=%v epoch=%d, want %d", ok, got.Unix(), now+3600)
+	if !ok {
+		t.Fatal("expected legacy warn file to load")
+	}
+	if _, blocked := state.blockedUntil(time.Now()); blocked {
+		t.Fatal("95% warning threshold must not count as a limit hit")
+	}
+	if !state.fresh(time.Now().Add(-time.Minute)) {
+		t.Fatal("legacy file mtime should count as written-at")
 	}
 
-	tiePath := filepath.Join(t.TempDir(), ".rl_warn")
-	tieContent := strings.Join([]string{
+	// The state file wins over the warn file once present.
+	current := strings.Join([]string{
+		"written_at=" + strconvFormat(now),
 		"5h_pct=100",
 		"5h_reset=" + strconvFormat(now+1800),
-		"7d_pct=100",
-		"7d_reset=" + strconvFormat(now+7200),
+		"7d_pct=10",
+		"7d_reset=" + strconvFormat(now+3600),
 	}, "\n")
-	if err := os.WriteFile(tiePath, []byte(tieContent), 0o600); err != nil {
+	if err := os.WriteFile(stateFile, []byte(current), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	got, ok, err = resetFromWarnFile(tiePath)
+	state, ok, err = loadRateLimitState(stateFile, warnFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || got.Unix() != now+7200 {
-		t.Fatalf("tie got ok=%v epoch=%d, want %d", ok, got.Unix(), now+7200)
+	until, blocked := state.blockedUntil(time.Now())
+	if !ok || !blocked || until.Unix() != now+1800 {
+		t.Fatalf("state file got ok=%v blocked=%v until=%d, want blocked until %d", ok, blocked, until.Unix(), now+1800)
+	}
+	if state.fresh(time.Now().Add(time.Hour)) {
+		t.Fatal("snapshot written before the run must not be fresh")
 	}
 }
 
@@ -334,6 +711,9 @@ func TestLoadConfigHonorsClaudeConfigDir(t *testing.T) {
 	}
 	if cfg.WarnFile != filepath.Join(claudeConfigDir, ".rl_warn") {
 		t.Fatalf("WarnFile got %q", cfg.WarnFile)
+	}
+	if cfg.StateFile != filepath.Join(claudeConfigDir, ".rate_limits") {
+		t.Fatalf("StateFile got %q", cfg.StateFile)
 	}
 }
 
@@ -395,7 +775,7 @@ session_dir="$PROJECTS_DIR/fake-project"
 mkdir -p "$session_dir" "$(dirname "$WARN_FILE")"
 printf '{"type":"message","message":"started"}\n' > "$session_dir/$SESSION_ID.jsonl"
 now=$(date +%s)
-printf '5h_pct=95\n5h_reset=%s\n7d_pct=10\n7d_reset=%s\n' "$((now + 60))" "$((now + 3600))" > "$WARN_FILE"
+printf '5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=%s\n' "$((now + 60))" "$((now + 3600))" > "$WARN_FILE"
 exit 0
 `)
 
@@ -531,12 +911,12 @@ count=$((count + 1))
 printf '%s\n' "$count" > "$STATE_FILE"
 printf '%s\n' "$*" >> "$ARGS_LOG"
 session_dir="$PROJECTS_DIR/fake-project"
-mkdir -p "$session_dir" "$(dirname "$WARN_FILE")"
+mkdir -p "$session_dir" "$(dirname "$RL_STATE")"
 session="$session_dir/$SESSION_ID.jsonl"
 if [ "$count" -eq 1 ]; then
   printf '{"type":"message","content":"first"}\n' > "$session"
   now=$(date +%s)
-  printf '5h_pct=95\n5h_reset=%s\n7d_pct=10\n7d_reset=%s\n' "$now" "$now" > "$WARN_FILE"
+  printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" "$((now + 3))" > "$RL_STATE"
   exit 0
 fi
 printf '{"type":"message","content":"second"}\n' >> "$session"
@@ -550,13 +930,11 @@ exit 3
 	cfg.Env = append(os.Environ(),
 		"PROJECTS_DIR="+projectsDir,
 		"WARN_FILE="+warnFile,
+		"RL_STATE="+cfg.StateFile,
 		"ARGS_LOG="+argsLog,
 		"STATE_FILE="+stateFile,
 		"SESSION_ID="+sessionID,
 	)
-	cfg.Now = func() time.Time {
-		return time.Date(2026, time.April, 13, 12, 0, 0, 0, time.UTC)
-	}
 
 	code := run(context.Background(), cfg, []string{
 		"--settings", "settings.json",
@@ -583,8 +961,161 @@ exit 3
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || !strings.HasPrefix(title, "rl-2026-04-13-") {
+	if !ok || !strings.HasPrefix(title, "rl-") {
 		t.Fatalf("expected generated title, ok=%v title=%q", ok, title)
+	}
+
+	// Non-TTY writers must never receive ANSI escapes.
+	if strings.Contains(stderr.String(), "\033") {
+		t.Fatalf("stderr contains ANSI escapes: %q", stderr.String())
+	}
+}
+
+func TestRunDoesNotResumeAtWarningThreshold(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	projectsDir := filepath.Join(dir, "projects")
+	warnFile := filepath.Join(dir, ".claude", ".rl_warn")
+	argsLog := filepath.Join(dir, "args.log")
+	sessionID := "22222222-2222-2222-2222-222222222222"
+	script := writeScript(t, dir, "fake-claude", `#!/bin/sh
+printf '%s\n' "$*" >> "$ARGS_LOG"
+session_dir="$PROJECTS_DIR/fake-project"
+mkdir -p "$session_dir" "$(dirname "$RL_STATE")"
+printf '{"type":"message","content":"worked fine"}\n' > "$session_dir/$SESSION_ID.jsonl"
+now=$(date +%s)
+printf 'written_at=%s\n5h_pct=91.2\n5h_reset=%s\n7d_pct=97\n7d_reset=%s\n' "$now" "$((now + 1800))" "$((now + 86400))" > "$RL_STATE"
+exit 0
+`)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cfg := testConfig(script, projectsDir, warnFile, &stdout, &stderr)
+	cfg.Env = append(os.Environ(),
+		"PROJECTS_DIR="+projectsDir,
+		"RL_STATE="+cfg.StateFile,
+		"ARGS_LOG="+argsLog,
+		"SESSION_ID="+sessionID,
+	)
+
+	code := run(context.Background(), cfg, []string{"--model", "sonnet"})
+	if code != 0 {
+		t.Fatalf("exit code got %d, want 0", code)
+	}
+	if got := readLines(t, argsLog); len(got) != 1 {
+		t.Fatalf("expected a single launch, got %d: %#v", len(got), got)
+	}
+	if strings.Contains(stderr.String(), "Rate limit hit") {
+		t.Fatalf("high-but-not-exhausted usage must not schedule a resume, stderr: %q", stderr.String())
+	}
+}
+
+func TestRunTerminatesInteractiveClaudeOnLimit(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	projectsDir := filepath.Join(dir, "projects")
+	warnFile := filepath.Join(dir, ".claude", ".rl_warn")
+	argsLog := filepath.Join(dir, "args.log")
+	stateFile := filepath.Join(dir, "state")
+	sessionID := "33333333-3333-3333-3333-333333333333"
+	// Mimics claude's interactive TUI: the first Ctrl-C only cancels input,
+	// a second one within the grace window exits.
+	script := writeScript(t, dir, "fake-claude", `#!/bin/sh
+count=0
+if [ -f "$STATE_FILE" ]; then
+  count=$(cat "$STATE_FILE")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$STATE_FILE"
+printf '%s\n' "$*" >> "$ARGS_LOG"
+session_dir="$PROJECTS_DIR/fake-project"
+mkdir -p "$session_dir" "$(dirname "$RL_STATE")"
+session="$session_dir/$SESSION_ID.jsonl"
+if [ "$count" -eq 1 ]; then
+  printf '{"type":"message","content":"first"}\n' > "$session"
+  ints=0
+  trap 'ints=$((ints + 1)); if [ "$ints" -ge 2 ]; then exit 130; fi' INT
+  now=$(date +%s)
+  printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" "$((now + 3))" > "$RL_STATE"
+  while :; do sleep 0.05; done
+fi
+printf '{"type":"message","content":"second"}\n' >> "$session"
+exit 0
+`)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cfg := testConfig(script, projectsDir, warnFile, &stdout, &stderr)
+	cfg.Env = append(os.Environ(),
+		"PROJECTS_DIR="+projectsDir,
+		"RL_STATE="+cfg.StateFile,
+		"ARGS_LOG="+argsLog,
+		"STATE_FILE="+stateFile,
+		"SESSION_ID="+sessionID,
+	)
+
+	code := run(context.Background(), cfg, []string{"--model", "sonnet"})
+	if code != 0 {
+		t.Fatalf("exit code got %d, want 0 after auto-resume, stderr: %q", code, stderr.String())
+	}
+	if got := readLines(t, argsLog); len(got) != 2 {
+		t.Fatalf("expected launch + resume, got %d launches: %#v", len(got), got)
+	}
+	if !strings.Contains(stderr.String(), "Rate limit hit") {
+		t.Fatalf("expected rate limit banner, stderr: %q", stderr.String())
+	}
+}
+
+func TestRunKillsClaudeThatIgnoresSignals(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	projectsDir := filepath.Join(dir, "projects")
+	warnFile := filepath.Join(dir, ".claude", ".rl_warn")
+	argsLog := filepath.Join(dir, "args.log")
+	stateFile := filepath.Join(dir, "state")
+	sessionID := "44444444-4444-4444-4444-444444444444"
+	script := writeScript(t, dir, "fake-claude", `#!/bin/sh
+count=0
+if [ -f "$STATE_FILE" ]; then
+  count=$(cat "$STATE_FILE")
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$STATE_FILE"
+printf '%s\n' "$*" >> "$ARGS_LOG"
+session_dir="$PROJECTS_DIR/fake-project"
+mkdir -p "$session_dir" "$(dirname "$RL_STATE")"
+session="$session_dir/$SESSION_ID.jsonl"
+if [ "$count" -eq 1 ]; then
+  printf '{"type":"message","content":"first"}\n' > "$session"
+  trap '' INT TERM
+  now=$(date +%s)
+  printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" "$((now + 3))" > "$RL_STATE"
+  while :; do sleep 0.05; done
+fi
+printf '{"type":"message","content":"second"}\n' >> "$session"
+exit 0
+`)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cfg := testConfig(script, projectsDir, warnFile, &stdout, &stderr)
+	cfg.InterruptRepeat = 20 * time.Millisecond
+	cfg.InterruptGrace = 50 * time.Millisecond
+	cfg.TermGrace = 50 * time.Millisecond
+	cfg.Env = append(os.Environ(),
+		"PROJECTS_DIR="+projectsDir,
+		"RL_STATE="+cfg.StateFile,
+		"ARGS_LOG="+argsLog,
+		"STATE_FILE="+stateFile,
+		"SESSION_ID="+sessionID,
+	)
+
+	code := run(context.Background(), cfg, []string{"--model", "sonnet"})
+	if code != 0 {
+		t.Fatalf("exit code got %d, want 0 after auto-resume, stderr: %q", code, stderr.String())
+	}
+	if got := readLines(t, argsLog); len(got) != 2 {
+		t.Fatalf("expected launch + resume, got %d launches: %#v", len(got), got)
 	}
 }
 
@@ -751,18 +1282,22 @@ func writeScript(t *testing.T, dir string, name string, body string) string {
 
 func testConfig(claudeBin string, projectsDir string, warnFile string, stdout *bytes.Buffer, stderr *bytes.Buffer) config {
 	return config{
-		ClaudeBin:     claudeBin,
-		ProjectsDir:   projectsDir,
-		WarnFile:      warnFile,
-		Buffer:        0,
-		WatchInterval: 10 * time.Millisecond,
-		WatchTimeout:  50 * time.Millisecond,
-		WatchSettle:   0,
-		Stdin:         strings.NewReader(""),
-		Stdout:        stdout,
-		Stderr:        stderr,
-		Env:           os.Environ(),
-		Now:           time.Now,
+		ClaudeBin:           claudeBin,
+		ProjectsDir:         projectsDir,
+		WarnFile:            warnFile,
+		StateFile:           warnFile + ".rate_limits",
+		Buffer:              0,
+		WatchInterval:       10 * time.Millisecond,
+		WatchSettle:         0,
+		InterruptRepeat:     200 * time.Millisecond,
+		InterruptGrace:      5 * time.Second,
+		TermGrace:           2 * time.Second,
+		RelaunchGuardWindow: 2 * time.Minute,
+		Stdin:               strings.NewReader(""),
+		Stdout:              stdout,
+		Stderr:              stderr,
+		Env:                 os.Environ(),
+		Now:                 time.Now,
 	}
 }
 
