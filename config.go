@@ -29,7 +29,6 @@ type config struct {
 	Buffer              time.Duration
 	SkipPermissions     bool
 	WatchInterval       time.Duration
-	WatchSettle         time.Duration
 	InterruptRepeat     time.Duration
 	InterruptGrace      time.Duration
 	TermGrace           time.Duration
@@ -103,7 +102,6 @@ func loadConfig() (config, error) {
 		Buffer:              time.Duration(bufferSecs) * time.Second,
 		SkipPermissions:     boolEnv("CLAUDE_SMART_RESUME_SKIP_PERMISSIONS"),
 		WatchInterval:       time.Duration(watchSecs) * time.Second,
-		WatchSettle:         300 * time.Millisecond,
 		InterruptRepeat:     300 * time.Millisecond,
 		InterruptGrace:      5 * time.Second,
 		TermGrace:           2 * time.Second,

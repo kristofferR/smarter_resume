@@ -262,15 +262,29 @@ func findResetInfo(path string, startLine int) (resetInfo, bool, error) {
 	}
 }
 
+// resetInfoFromJSONLine extracts a limit notice from a transcript record.
+// Only assistant records flagged isApiErrorMessage carry genuine notices
+// (e.g. "You've hit your session limit · resets 7:10pm (Europe/Oslo)"), and
+// only their message content is scanned. Nothing else may ever match:
+// transcripts embed tool results and model prose, so a read file or a
+// conversation that merely mentions "resets 3pm" must not read as a limit
+// hit — that false positive killed live sessions and scheduled day-long waits.
 func resetInfoFromJSONLine(line []byte) (resetInfo, bool) {
 	var obj map[string]any
 	if err := json.Unmarshal(line, &obj); err != nil {
 		return resetInfo{}, false
 	}
+	if obj["type"] != "assistant" || obj["isApiErrorMessage"] != true {
+		return resetInfo{}, false
+	}
+	msg, _ := obj["message"].(map[string]any)
+	if msg == nil {
+		return resetInfo{}, false
+	}
 
 	var latest resetInfo
 	found := false
-	for _, s := range collectJSONStrings(obj, nil, 0) {
+	for _, s := range messageTexts(msg["content"]) {
 		if info, ok := resetInfoFromText(s); ok {
 			latest = info
 			found = true
@@ -282,32 +296,27 @@ func resetInfoFromJSONLine(line []byte) (resetInfo, bool) {
 	return latest, found
 }
 
-const (
-	maxScanDepth   = 8
-	maxScanStrings = 200
-)
-
-// collectJSONStrings gathers every string value anywhere in v. Limit notices
-// land in different shapes across claude versions — flat "message"/"error"
-// fields, or nested message.content[].text on user/assistant records — so no
-// record type or key is privileged.
-func collectJSONStrings(v any, out []string, depth int) []string {
-	if depth > maxScanDepth || len(out) >= maxScanStrings {
+// messageTexts extracts the scannable text of a message content value: a flat
+// string, or the "text" fields of typed text blocks. Other block fields (tool
+// payloads and the like) are never scanned.
+func messageTexts(content any) []string {
+	switch t := content.(type) {
+	case string:
+		return []string{t}
+	case []any:
+		var out []string
+		for _, block := range t {
+			m, ok := block.(map[string]any)
+			if !ok || m["type"] != "text" {
+				continue
+			}
+			if s, ok := m["text"].(string); ok {
+				out = append(out, s)
+			}
+		}
 		return out
 	}
-	switch t := v.(type) {
-	case string:
-		out = append(out, t)
-	case map[string]any:
-		for _, val := range t {
-			out = collectJSONStrings(val, out, depth+1)
-		}
-	case []any:
-		for _, val := range t {
-			out = collectJSONStrings(val, out, depth+1)
-		}
-	}
-	return out
+	return nil
 }
 
 func recordTimestamp(obj map[string]any) time.Time {
@@ -335,6 +344,67 @@ func resetInfoFromText(text string) (resetInfo, bool) {
 		Text: strings.TrimSpace(last[1]),
 		TZ:   tz,
 	}, true
+}
+
+// sessionContinuedAfter reports whether the transcript, from startLine on,
+// contains genuine progress recorded after resetAt: assistant output that is
+// not an API error, or a typed user prompt. Ambient writes — tool results
+// landing from background tasks, records without timestamps, error notices —
+// must not read as the session having moved on, or a background task
+// finishing during the wake buffer would cancel the restart and leave a
+// stalled session unresumed.
+func sessionContinuedAfter(path string, startLine int, resetAt time.Time) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	if startLine < 1 {
+		startLine = 1
+	}
+
+	lineNo := 0
+	reader := bufio.NewReader(f)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			if lineNo >= startLine && recordShowsProgress(line, resetAt) {
+				return true
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// recordShowsProgress reports whether a transcript record is post-reset
+// session progress: successful assistant output, or a user prompt (not a
+// tool result) — in both cases timestamped after resetAt.
+func recordShowsProgress(line []byte, resetAt time.Time) bool {
+	var obj map[string]any
+	if err := json.Unmarshal(line, &obj); err != nil {
+		return false
+	}
+	ts := recordTimestamp(obj)
+	if ts.IsZero() || !ts.After(resetAt) {
+		return false
+	}
+	msg, _ := obj["message"].(map[string]any)
+	if msg == nil {
+		return false
+	}
+	switch obj["type"] {
+	case "assistant":
+		return obj["isApiErrorMessage"] != true
+	case "user":
+		// Typed prompts carry string content or text blocks; tool results
+		// arrive as tool_result blocks, which messageTexts ignores.
+		return len(messageTexts(msg["content"])) > 0
+	}
+	return false
 }
 
 func generateSessionName(now time.Time, cwd string) string {

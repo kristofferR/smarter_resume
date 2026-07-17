@@ -18,13 +18,11 @@ func TestFindResetInfoUsesJSONAndStartLine(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
 	content := strings.Join([]string{
-		`{"type":"error","message":"old reset resets 7:00pm (UTC)"}`,
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"old notice resets 7:00pm (UTC)"}]}}`,
 		`{"type":"message","content":"not a reset"}`,
-		`{"type":"result","nested":{"text":"API limit resets Apr 14, 2026 11:30pm (America/New_York)."}}`,
-		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ordinary content says resets 8:00pm (UTC)"}]}}`,
 		`not-json but resets 1:00pm (UTC)`,
-		`{"type":"error","message":"RESETS 9:15pm (Asia/Kolkata)"}`,
-		`{"type":"error","message":"Your limit will reset at 3:00pm (America/Santiago)"}`,
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"RESETS 9:15pm (Asia/Kolkata)"}]}}`,
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"Your limit will reset at 3:00pm (America/Santiago)"}]}}`,
 	}, "\n")
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
@@ -42,10 +40,43 @@ func TestFindResetInfoUsesJSONAndStartLine(t *testing.T) {
 	}
 }
 
-func TestFindResetInfoReadsNestedAssistantRecords(t *testing.T) {
+// Only assistant records flagged isApiErrorMessage may count as limit notices.
+// Tool results, model prose, and any other record embedding "resets <time>"
+// text killed live sessions when this repo's own source (which contains such
+// strings) was read into a wrapped session.
+func TestFindResetInfoIgnoresToolResultsAndProse(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "session.jsonl")
-	content := `{"type":"assistant","timestamp":"2026-04-13T10:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"5-hour limit reached. Your limit will reset at 3:00pm (America/Santiago)."}]}}` + "\n"
+	content := strings.Join([]string{
+		// A Read tool result carrying this repo's own source code.
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"// Anchor ambiguous times (\"resets 3pm\") to the moment the notice was"}]}}`,
+		`{"type":"user","toolUseResult":{"file":{"content":"limit reached - resets 3am (UTC)"}}}`,
+		// The model talking about rate limits.
+		`{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"the 5h bucket resets 8:00pm (UTC)"}]}}`,
+		// Flat legacy-looking shapes without the API-error flag.
+		`{"type":"error","message":"resets 9:15pm (Asia/Kolkata)"}`,
+		`{"type":"result","nested":{"text":"API limit resets Apr 14, 2026 11:30pm (America/New_York)."}}`,
+		// An API error that is not a limit notice.
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"API Error: 529 Overloaded"}]}}`,
+		// Reset-like text outside a text block, even on a flagged record.
+		`{"type":"assistant","isApiErrorMessage":true,"message":{"content":[{"type":"tool_use","input":{"note":"resets 4:00pm (UTC)"}}]}}`,
+	}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if info, ok, err := findResetInfo(path, 1); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("no record here is a genuine limit notice, got %#v", info)
+	}
+}
+
+func TestFindResetInfoReadsGenuineLimitNotice(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	// The exact shape claude writes on a hit limit.
+	content := `{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-04-13T10:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"You've hit your session limit · resets 3:00pm (America/Santiago)"}]}}` + "\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +86,7 @@ func TestFindResetInfoReadsNestedAssistantRecords(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !ok {
-		t.Fatal("expected nested assistant limit notice to be detected")
+		t.Fatal("expected genuine limit notice to be detected")
 	}
 	if info.Text != "3:00pm" || info.TZ != "America/Santiago" {
 		t.Fatalf("unexpected reset info: %#v", info)
@@ -285,7 +316,7 @@ func TestResetAfterRunDecisions(t *testing.T) {
 		// Notice at 10:00 saying "resets 3pm"; claude exited at 18:00 — the
 		// limit lifted hours ago, the session simply continued past it.
 		session := writeSession(t, dir,
-			`{"type":"assistant","timestamp":"2026-04-13T10:00:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 3pm (UTC)"}]}}`)
+			`{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-04-13T10:00:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 3pm (UTC)"}]}}`)
 
 		_, ok, err := resetAfterRun(cfg, session, 1, now.Add(-9*time.Hour))
 		if err != nil {
@@ -300,7 +331,7 @@ func TestResetAfterRunDecisions(t *testing.T) {
 		dir := t.TempDir()
 		cfg := newCfg(dir)
 		session := writeSession(t, dir,
-			`{"type":"assistant","timestamp":"2026-04-13T17:55:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 9pm (UTC)"}]}}`)
+			`{"type":"assistant","isApiErrorMessage":true,"timestamp":"2026-04-13T17:55:00Z","message":{"content":[{"type":"text","text":"limit reached, resets 9pm (UTC)"}]}}`)
 
 		reset, ok, err := resetAfterRun(cfg, session, 1, now.Add(-time.Hour))
 		if err != nil {
@@ -1010,7 +1041,10 @@ exit 0
 	}
 }
 
-func TestRunTerminatesInteractiveClaudeOnLimit(t *testing.T) {
+// A limit hit mid-run must not kill claude immediately — background shells
+// die with it. The watcher waits the limit out while claude keeps running and
+// restarts it only once the limits lifted.
+func TestRunRestartsInteractiveClaudeAfterLimitLifts(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	projectsDir := filepath.Join(dir, "projects")
@@ -1027,7 +1061,7 @@ if [ -f "$STATE_FILE" ]; then
 fi
 count=$((count + 1))
 printf '%s\n' "$count" > "$STATE_FILE"
-printf '%s\n' "$*" >> "$ARGS_LOG"
+printf '%s %s\n' "$(date +%s)" "$*" >> "$ARGS_LOG"
 session_dir="$PROJECTS_DIR/fake-project"
 mkdir -p "$session_dir" "$(dirname "$RL_STATE")"
 session="$session_dir/$SESSION_ID.jsonl"
@@ -1058,11 +1092,109 @@ exit 0
 	if code != 0 {
 		t.Fatalf("exit code got %d, want 0 after auto-resume, stderr: %q", code, stderr.String())
 	}
-	if got := readLines(t, argsLog); len(got) != 2 {
-		t.Fatalf("expected launch + resume, got %d launches: %#v", len(got), got)
+	launches := readLines(t, argsLog)
+	if len(launches) != 2 {
+		t.Fatalf("expected launch + resume, got %d launches: %#v", len(launches), launches)
 	}
-	if !strings.Contains(stderr.String(), "Rate limit hit") {
-		t.Fatalf("expected rate limit banner, stderr: %q", stderr.String())
+	// The restart must not happen before the reset epoch the stub announced.
+	resumedAt := launchEpoch(t, launches[1])
+	if reset := stateFileEpoch(t, cfg.StateFile, "5h_reset"); resumedAt < reset {
+		t.Fatalf("claude was restarted at %d, before the limit lifted at %d", resumedAt, reset)
+	}
+	if !strings.Contains(stderr.String(), "Rate limit lifted") {
+		t.Fatalf("expected deferred-restart notice, stderr: %q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Rate limit hit") {
+		t.Fatalf("countdown banner must not print while claude handles the wait, stderr: %q", stderr.String())
+	}
+}
+
+// A snapshot detection that lands before the run's session file exists must
+// stay pending — not enter the wait with an empty path, which would freeze
+// discovery, skip the stall check, and restart a session that continued after
+// the reset on its own.
+func TestRunHoldsRestartUntilSessionFileResolved(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	projectsDir := filepath.Join(dir, "projects")
+	warnFile := filepath.Join(dir, ".claude", ".rl_warn")
+	argsLog := filepath.Join(dir, "args.log")
+	sessionID := "55555555-5555-5555-5555-555555555555"
+	// Blocked snapshot exists from the start; the transcript only appears
+	// after the reset has passed, carrying post-reset activity.
+	script := writeScript(t, dir, "fake-claude", `#!/bin/sh
+printf '%s\n' "$*" >> "$ARGS_LOG"
+mkdir -p "$(dirname "$RL_STATE")"
+now=$(date +%s)
+printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" "$((now + 2))" > "$RL_STATE"
+sleep 3
+session_dir="$PROJECTS_DIR/fake-project"
+mkdir -p "$session_dir"
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"text","text":"continued after reset"}]}}\n' "$ts" > "$session_dir/$SESSION_ID.jsonl"
+sleep 1
+exit 0
+`)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cfg := testConfig(script, projectsDir, warnFile, &stdout, &stderr)
+	cfg.Env = append(os.Environ(),
+		"PROJECTS_DIR="+projectsDir,
+		"RL_STATE="+cfg.StateFile,
+		"ARGS_LOG="+argsLog,
+		"SESSION_ID="+sessionID,
+	)
+
+	code := run(context.Background(), cfg, []string{"--model", "sonnet"})
+	if code != 0 {
+		t.Fatalf("exit code got %d, want 0, stderr: %q", code, stderr.String())
+	}
+	if got := readLines(t, argsLog); len(got) != 1 {
+		t.Fatalf("session continued past the reset and must not be restarted, got %d launches: %#v", len(got), got)
+	}
+}
+
+// waitOutLimit must only green-light a restart for a stalled session: genuine
+// post-reset progress (assistant output, typed prompts) means the session
+// already continued, while ambient writes — background tool results landing
+// during the wake buffer, error notices, pre-reset queued prompts — must not
+// cancel the restart.
+func TestWaitOutLimitRestartsOnlyStalledSessions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := config{
+		StateFile: filepath.Join(dir, ".rate_limits"),
+		WarnFile:  filepath.Join(dir, ".rl_warn"),
+		Now:       time.Now,
+	}
+	resetAt := time.Now().Add(-time.Minute)
+	afterReset := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+	beforeReset := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	writeSession := func(name string, lines ...string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	continued := writeSession("continued.jsonl",
+		`{"type":"assistant","timestamp":"`+afterReset+`","message":{"content":[{"type":"text","text":"back to work"}]}}`)
+	if waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), continued, 1) {
+		t.Fatal("post-reset assistant progress must not trigger a restart")
+	}
+
+	stalled := writeSession("stalled.jsonl",
+		`{"type":"user","timestamp":"`+beforeReset+`","message":{"content":"queued while blocked"}}`,
+		`{"type":"user","timestamp":"`+afterReset+`","message":{"content":[{"type":"tool_result","content":"background task finished"}]}}`,
+		`{"type":"assistant","isApiErrorMessage":true,"timestamp":"`+afterReset+`","message":{"content":[{"type":"text","text":"limit reached, resets 9pm (UTC)"}]}}`)
+	if !waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), stalled, 1) {
+		t.Fatal("ambient writes must not read as recovery; stalled session must restart")
+	}
+
+	if !waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), stalled, 4) {
+		t.Fatal("records before startLine must be ignored")
 	}
 }
 
@@ -1288,7 +1420,6 @@ func testConfig(claudeBin string, projectsDir string, warnFile string, stdout *b
 		StateFile:           warnFile + ".rate_limits",
 		Buffer:              0,
 		WatchInterval:       10 * time.Millisecond,
-		WatchSettle:         0,
 		InterruptRepeat:     200 * time.Millisecond,
 		InterruptGrace:      5 * time.Second,
 		TermGrace:           2 * time.Second,
@@ -1312,6 +1443,40 @@ func readLines(t *testing.T, path string) []string {
 		return nil
 	}
 	return strings.Split(trimmed, "\n")
+}
+
+// launchEpoch reads the leading `date +%s` stamp a fake-claude script wrote to
+// its args log line.
+func launchEpoch(t *testing.T, logLine string) int64 {
+	t.Helper()
+	field, _, _ := strings.Cut(logLine, " ")
+	n, err := strconv.ParseInt(field, 10, 64)
+	if err != nil {
+		t.Fatalf("launch log line %q has no leading epoch: %v", logLine, err)
+	}
+	return n
+}
+
+// stateFileEpoch reads one epoch value from a key=value rate-limit snapshot.
+func stateFileEpoch(t *testing.T, path string, key string) int64 {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || k != key {
+			continue
+		}
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			t.Fatalf("state %s=%q: %v", key, v, err)
+		}
+		return n
+	}
+	t.Fatalf("state file %s missing %s", path, key)
+	return 0
 }
 
 type cancelOnWrite struct {

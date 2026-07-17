@@ -40,18 +40,23 @@ ignored. The legacy `.rl_warn` sentinel is still read (with the same
 100%-threshold semantics) when no snapshot exists.
 
 When no usable snapshot is available, the wrapper falls back to scanning the
-session transcript for the "resets ..." notice — every string in each JSONL
-record is searched (including nested assistant content), 12/24-hour times and
+session transcript for the "resets ..." notice. Only assistant records flagged
+`isApiErrorMessage` — the shape Claude Code actually writes on a hit limit —
+are considered, and only their message content is searched. Tool results, file
+contents, and ordinary model prose can never match, so reading or discussing
+text like "resets 3pm" does not trigger a false limit. 12/24-hour times and
 bare timezone abbreviations (`PST`, `CEST`, `UTC+2`, ...) are understood, and
 ambiguous times are anchored to the notice's own timestamp so a limit that was
 already waited out never triggers a spurious resume.
 
 ### Reliability behavior
 
-- While Claude runs, a watcher polls the snapshot and the transcript; when a
-  limit is hit it terminates Claude with an escalating sequence (SIGINT ×2 —
-  the interactive TUI needs two Ctrl-C — then SIGTERM, then SIGKILL) so the
-  wait starts immediately instead of hanging on a stalled session.
+- While Claude runs, a watcher polls the snapshot and the transcript. When a
+  limit is hit it does **not** kill Claude — background shells and tasks keep
+  running through the wait. Once the limits have verifiably lifted (and the
+  transcript shows the session is still stalled), it restarts Claude with an
+  escalating sequence (SIGINT ×2 — the interactive TUI needs two Ctrl-C — then
+  SIGTERM, then SIGKILL) and immediately resumes the session so work continues.
 - Before resuming, the wrapper re-checks the snapshot; if the limits have not
   actually lifted, it extends the wait instead of resuming early.
 - If a resume re-hits the limit right away, an escalating extra buffer (up to
