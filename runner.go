@@ -77,8 +77,14 @@ func run(ctx context.Context, cfg config, args []string) int {
 
 		// A limit detection shortly after a resume means the reset estimate
 		// was early or the resumed turn immediately re-hit the limit — back
-		// off instead of relaunching in a tight loop.
-		if !lastResumeAt.IsZero() && cfg.Now().Sub(lastResumeAt) < cfg.RelaunchGuardWindow {
+		// off instead of relaunching in a tight loop. Deferred restarts
+		// measure from when the watcher first saw the limit, not from now:
+		// the waited-out reset must not mask an immediate re-hit.
+		guardRef := cfg.Now()
+		if watched.limitResume && !watched.detectedAt.IsZero() {
+			guardRef = watched.detectedAt
+		}
+		if !lastResumeAt.IsZero() && guardRef.Sub(lastResumeAt) < cfg.RelaunchGuardWindow {
 			extraBuffer = minDuration(extraBuffer*2+cfg.Buffer, maxExtraBuffer)
 		} else {
 			extraBuffer = 0
@@ -249,10 +255,13 @@ func sessionIDFromPath(path string) string {
 // watchResult reports what the in-run watcher concluded. limitResume means the
 // watcher hit a usage limit, waited it out while claude kept running, verified
 // the limits lifted, and then ended the run — the caller should resume the
-// session immediately.
+// session immediately. detectedAt is when that limit was first observed, so
+// the relaunch guard can measure detection-to-resume spacing rather than the
+// (arbitrarily long) wait the watcher just performed.
 type watchResult struct {
 	limitResume bool
 	sessionFile string
+	detectedAt  time.Time
 }
 
 func runClaude(ctx context.Context, cfg config, args []string, cwd string, runStarted time.Time, preRunFile string, preRunLines int) (int, watchResult, error) {
@@ -399,12 +408,22 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 
 	sessionFile := ""
 	baseline := 0
+	// detectLine is the transcript position when the pending limit was
+	// detected; the post-reset progress check starts right after it, so lines
+	// the scanner consumed later in the same watch (or that appeared while
+	// discovery was still pending) still count as progress.
+	detectLine := 0
 	var resetAt time.Time
+	var detectedAt time.Time
 	detected := false
 
 	for {
 		if until, blocked := stateBlockedUntil(cfg, runStarted); blocked {
 			resetAt = until
+			if !detected {
+				detectedAt = cfg.Now()
+				detectLine = baseline
+			}
 			detected = true
 		}
 
@@ -413,6 +432,9 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 				sessionFile = file
 				if sessionFile == preRunFile {
 					baseline = preRunLines
+					if detected && detectLine < baseline {
+						detectLine = baseline
+					}
 				}
 			}
 		}
@@ -423,6 +445,8 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 				if info, ok, err := findResetInfo(sessionFile, baseline+1); err == nil && ok && !detected {
 					if reset, ok := noticeResetTime(cfg, info); ok {
 						resetAt = reset
+						detectedAt = cfg.Now()
+						detectLine = current
 						detected = true
 					}
 				}
@@ -434,14 +458,14 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 		// stall check needs the transcript, and restarting a session we could
 		// not even locate risks killing one that continued after the reset.
 		if detected && sessionFile != "" {
-			if waitOutLimit(ctx, cfg, resetAt, runStarted, sessionFile) {
+			if waitOutLimit(ctx, cfg, resetAt, runStarted, sessionFile, detectLine+1) {
 				terminateClaude(ctx, cfg, process)
-				return watchResult{limitResume: true, sessionFile: sessionFile}
+				return watchResult{limitResume: true, sessionFile: sessionFile, detectedAt: detectedAt}
 			}
 			if ctx.Err() != nil {
 				return watchResult{sessionFile: sessionFile}
 			}
-			// The session produced output after the reset — it already
+			// The session made genuine progress after the reset — it already
 			// continued on its own (or the detection was wrong). Keep
 			// watching instead of restarting it out from under the user.
 			detected = false
@@ -482,10 +506,10 @@ func noticeResetTime(cfg config, info resetInfo) (time.Time, bool) {
 // waitOutLimit sleeps until the detected limit has actually lifted, extending
 // the wait whenever the snapshot still reports a blocking bucket (its absolute
 // reset epochs stay valid throughout). Returns true when the session should be
-// restarted: limits lifted with no transcript activity since, i.e. the session
-// is genuinely stalled. Returns false when ctx is cancelled (claude exited on
-// its own) or when the transcript shows post-reset activity.
-func waitOutLimit(ctx context.Context, cfg config, resetAt time.Time, runStarted time.Time, sessionFile string) bool {
+// restarted: limits lifted with no genuine progress since, i.e. the session is
+// still stalled. Returns false when ctx is cancelled (claude exited on its
+// own) or when the transcript shows post-reset progress.
+func waitOutLimit(ctx context.Context, cfg config, resetAt time.Time, runStarted time.Time, sessionFile string, startLine int) bool {
 	for {
 		if !sleepUntil(ctx, cfg, resetAt.Add(cfg.Buffer)) {
 			return false
@@ -501,12 +525,7 @@ func waitOutLimit(ctx context.Context, cfg config, resetAt time.Time, runStarted
 		break
 	}
 
-	if sessionFile != "" {
-		if info, err := os.Stat(sessionFile); err == nil && info.ModTime().After(resetAt) {
-			return false
-		}
-	}
-	return true
+	return !sessionContinuedAfter(sessionFile, startLine, resetAt)
 }
 
 // sleepUntil waits until wakeAt in short slices so wall-clock jumps (system

@@ -1130,7 +1130,9 @@ printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" 
 sleep 3
 session_dir="$PROJECTS_DIR/fake-project"
 mkdir -p "$session_dir"
-printf '{"type":"message","content":"continued after reset"}\n' > "$session_dir/$SESSION_ID.jsonl"
+ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '{"type":"assistant","timestamp":"%s","message":{"content":[{"type":"text","text":"continued after reset"}]}}\n' "$ts" > "$session_dir/$SESSION_ID.jsonl"
+sleep 1
 exit 0
 `)
 
@@ -1153,9 +1155,12 @@ exit 0
 	}
 }
 
-// waitOutLimit must only green-light a restart for a stalled session:
-// transcript writes after the reset mean the session already continued.
-func TestWaitOutLimitSkipsRestartWhenSessionContinued(t *testing.T) {
+// waitOutLimit must only green-light a restart for a stalled session: genuine
+// post-reset progress (assistant output, typed prompts) means the session
+// already continued, while ambient writes — background tool results landing
+// during the wake buffer, error notices, pre-reset queued prompts — must not
+// cancel the restart.
+func TestWaitOutLimitRestartsOnlyStalledSessions(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	cfg := config{
@@ -1163,22 +1168,33 @@ func TestWaitOutLimitSkipsRestartWhenSessionContinued(t *testing.T) {
 		WarnFile:  filepath.Join(dir, ".rl_warn"),
 		Now:       time.Now,
 	}
-	session := filepath.Join(dir, "session.jsonl")
-	if err := os.WriteFile(session, []byte("{}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	resetAt := time.Now().Add(-time.Minute)
-	if waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), session) {
-		t.Fatal("post-reset transcript activity must not trigger a restart")
+	afterReset := time.Now().Add(-30 * time.Second).UTC().Format(time.RFC3339)
+	beforeReset := time.Now().Add(-2 * time.Minute).UTC().Format(time.RFC3339)
+	writeSession := func(name string, lines ...string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
 	}
 
-	stale := time.Now().Add(-2 * time.Minute)
-	if err := os.Chtimes(session, stale, stale); err != nil {
-		t.Fatal(err)
+	continued := writeSession("continued.jsonl",
+		`{"type":"assistant","timestamp":"`+afterReset+`","message":{"content":[{"type":"text","text":"back to work"}]}}`)
+	if waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), continued, 1) {
+		t.Fatal("post-reset assistant progress must not trigger a restart")
 	}
-	if !waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), session) {
-		t.Fatal("stalled session must be restarted once the limit lifted")
+
+	stalled := writeSession("stalled.jsonl",
+		`{"type":"user","timestamp":"`+beforeReset+`","message":{"content":"queued while blocked"}}`,
+		`{"type":"user","timestamp":"`+afterReset+`","message":{"content":[{"type":"tool_result","content":"background task finished"}]}}`,
+		`{"type":"assistant","isApiErrorMessage":true,"timestamp":"`+afterReset+`","message":{"content":[{"type":"text","text":"limit reached, resets 9pm (UTC)"}]}}`)
+	if !waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), stalled, 1) {
+		t.Fatal("ambient writes must not read as recovery; stalled session must restart")
+	}
+
+	if !waitOutLimit(context.Background(), cfg, resetAt, time.Now().Add(-time.Hour), stalled, 4) {
+		t.Fatal("records before startLine must be ignored")
 	}
 }
 

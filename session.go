@@ -346,6 +346,67 @@ func resetInfoFromText(text string) (resetInfo, bool) {
 	}, true
 }
 
+// sessionContinuedAfter reports whether the transcript, from startLine on,
+// contains genuine progress recorded after resetAt: assistant output that is
+// not an API error, or a typed user prompt. Ambient writes — tool results
+// landing from background tasks, records without timestamps, error notices —
+// must not read as the session having moved on, or a background task
+// finishing during the wake buffer would cancel the restart and leave a
+// stalled session unresumed.
+func sessionContinuedAfter(path string, startLine int, resetAt time.Time) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	if startLine < 1 {
+		startLine = 1
+	}
+
+	lineNo := 0
+	reader := bufio.NewReader(f)
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNo++
+			if lineNo >= startLine && recordShowsProgress(line, resetAt) {
+				return true
+			}
+		}
+		if err != nil {
+			return false
+		}
+	}
+}
+
+// recordShowsProgress reports whether a transcript record is post-reset
+// session progress: successful assistant output, or a user prompt (not a
+// tool result) — in both cases timestamped after resetAt.
+func recordShowsProgress(line []byte, resetAt time.Time) bool {
+	var obj map[string]any
+	if err := json.Unmarshal(line, &obj); err != nil {
+		return false
+	}
+	ts := recordTimestamp(obj)
+	if ts.IsZero() || !ts.After(resetAt) {
+		return false
+	}
+	msg, _ := obj["message"].(map[string]any)
+	if msg == nil {
+		return false
+	}
+	switch obj["type"] {
+	case "assistant":
+		return obj["isApiErrorMessage"] != true
+	case "user":
+		// Typed prompts carry string content or text blocks; tool results
+		// arrive as tool_result blocks, which messageTexts ignores.
+		return len(messageTexts(msg["content"])) > 0
+	}
+	return false
+}
+
 func generateSessionName(now time.Time, cwd string) string {
 	slash := filepath.ToSlash(filepath.Clean(cwd))
 	parts := strings.FieldsFunc(slash, func(r rune) bool {
