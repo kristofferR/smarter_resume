@@ -1109,6 +1109,50 @@ exit 0
 	}
 }
 
+// A snapshot detection that lands before the run's session file exists must
+// stay pending — not enter the wait with an empty path, which would freeze
+// discovery, skip the stall check, and restart a session that continued after
+// the reset on its own.
+func TestRunHoldsRestartUntilSessionFileResolved(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	projectsDir := filepath.Join(dir, "projects")
+	warnFile := filepath.Join(dir, ".claude", ".rl_warn")
+	argsLog := filepath.Join(dir, "args.log")
+	sessionID := "55555555-5555-5555-5555-555555555555"
+	// Blocked snapshot exists from the start; the transcript only appears
+	// after the reset has passed, carrying post-reset activity.
+	script := writeScript(t, dir, "fake-claude", `#!/bin/sh
+printf '%s\n' "$*" >> "$ARGS_LOG"
+mkdir -p "$(dirname "$RL_STATE")"
+now=$(date +%s)
+printf 'written_at=%s\n5h_pct=100\n5h_reset=%s\n7d_pct=10\n7d_reset=0\n' "$now" "$((now + 2))" > "$RL_STATE"
+sleep 3
+session_dir="$PROJECTS_DIR/fake-project"
+mkdir -p "$session_dir"
+printf '{"type":"message","content":"continued after reset"}\n' > "$session_dir/$SESSION_ID.jsonl"
+exit 0
+`)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cfg := testConfig(script, projectsDir, warnFile, &stdout, &stderr)
+	cfg.Env = append(os.Environ(),
+		"PROJECTS_DIR="+projectsDir,
+		"RL_STATE="+cfg.StateFile,
+		"ARGS_LOG="+argsLog,
+		"SESSION_ID="+sessionID,
+	)
+
+	code := run(context.Background(), cfg, []string{"--model", "sonnet"})
+	if code != 0 {
+		t.Fatalf("exit code got %d, want 0, stderr: %q", code, stderr.String())
+	}
+	if got := readLines(t, argsLog); len(got) != 1 {
+		t.Fatalf("session continued past the reset and must not be restarted, got %d launches: %#v", len(got), got)
+	}
+}
+
 // waitOutLimit must only green-light a restart for a stalled session:
 // transcript writes after the reset mean the session already continued.
 func TestWaitOutLimitSkipsRestartWhenSessionContinued(t *testing.T) {

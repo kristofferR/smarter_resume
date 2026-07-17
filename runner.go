@@ -399,11 +399,10 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 
 	sessionFile := ""
 	baseline := 0
+	var resetAt time.Time
+	detected := false
 
 	for {
-		var resetAt time.Time
-		detected := false
-
 		if until, blocked := stateBlockedUntil(cfg, runStarted); blocked {
 			resetAt = until
 			detected = true
@@ -431,7 +430,10 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 			}
 		}
 
-		if detected {
+		// A detection stays pending until the session file is resolved: the
+		// stall check needs the transcript, and restarting a session we could
+		// not even locate risks killing one that continued after the reset.
+		if detected && sessionFile != "" {
 			if waitOutLimit(ctx, cfg, resetAt, runStarted, sessionFile) {
 				terminateClaude(ctx, cfg, process)
 				return watchResult{limitResume: true, sessionFile: sessionFile}
@@ -442,6 +444,7 @@ func watchForRateLimit(ctx context.Context, cfg config, cwd string, process *os.
 			// The session produced output after the reset — it already
 			// continued on its own (or the detection was wrong). Keep
 			// watching instead of restarting it out from under the user.
+			detected = false
 		}
 
 		select {
