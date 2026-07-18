@@ -1,15 +1,14 @@
 # smarter_resume
 
-Cross-platform rewrite of [Smart Resume for Claude Code](https://github.com/kristofferR/smart_resume)
-as a single Go binary.
+The successor to
+[Smart Resume for Claude Code](https://github.com/kristofferR/smart_resume),
+rebuilt from the ground up as a single cross-platform Go binary.
 
 It replaces the three divergent Bash/Zsh wrapper scripts (Linux / WSL / macOS)
 with one statically-linked binary — no `python3` dependency, real JSON +
 timezone parsing, first-class signal handling, and platform-independent tests.
-
-**Status:** first Go implementation. See
-[#1](https://github.com/kristofferR/smarter_resume/issues/1) for the design and
-acceptance criteria.
+The design and acceptance criteria live in
+[#1](https://github.com/kristofferR/smarter_resume/issues/1).
 
 ## What it does
 
@@ -93,6 +92,28 @@ detection path; see "How limits are detected" above for the format. Without
 it, the wrapper still works via transcript parsing, just with fewer
 guarantees.
 
+### Statusline snippet
+
+Claude Code pipes a JSON payload to the configured
+[statusline command](https://docs.anthropic.com/en/docs/claude-code/statusline)
+on each statusline update, including exact rate-limit utilization and reset
+epochs. If your statusline script starts with `input=$(cat)`, appending this
+writes the snapshot atomically — and leaves the previous snapshot untouched
+when the payload carries no rate-limit data:
+
+```sh
+rl_state="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.rate_limits"
+if printf '%s\n' "$input" | jq -e '.rate_limits.five_hour.used_percentage != null' >/dev/null 2>&1; then
+    printf '%s\n' "$input" | jq -r --arg now "$(date +%s)" '
+        "written_at=\($now)",
+        "5h_pct=\(.rate_limits.five_hour.used_percentage // 0)",
+        "5h_reset=\(.rate_limits.five_hour.resets_at // 0)",
+        "7d_pct=\(.rate_limits.seven_day.used_percentage // 0)",
+        "7d_reset=\(.rate_limits.seven_day.resets_at // 0)"
+    ' > "${rl_state}.tmp.$$" && mv -f "${rl_state}.tmp.$$" "$rl_state"
+fi
+```
+
 Smart Resume can also prepend default Claude args to every wrapped session.
 Those args are preserved when the wrapper auto-resumes the session:
 
@@ -148,4 +169,4 @@ names match the installer contract, for example
 
 ## License
 
-MIT (matching upstream).
+MIT.
